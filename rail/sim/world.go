@@ -60,23 +60,32 @@ func NewWorld(net *Network) *World {
 func (w *World) Seconds() float64 { return float64(w.Tick) * DT }
 
 // AddTrain places a train with its head at the exit end of
-// route.Legs[leg].Steps[step]. If that step ends the leg, the train starts
-// dwelling at the leg's station.
+// route.Legs[leg].Steps[step]; the body may extend back over earlier steps of
+// the same leg. If that step ends the leg, the train starts dwelling at the
+// leg's station.
 func (w *World) AddTrain(spec TrainSpec, route Route, leg, step int) (*Train, error) {
 	if leg < 0 || leg >= len(route.Legs) || step < 0 || step >= len(route.Legs[leg].Steps) {
 		return nil, fmt.Errorf("train %s: start position out of range", spec.Name)
 	}
-	s := route.Legs[leg].Steps[step]
-	if l := w.Net.StepLength(s); spec.Length > l {
-		return nil, fmt.Errorf("train %s (%.0fm) longer than start block (%.0fm)", spec.Name, spec.Length, l)
+	steps := route.Legs[leg].Steps
+	first, covered := step, w.Net.StepLength(steps[step])
+	for covered < spec.Length && first > 0 {
+		first--
+		covered += w.Net.StepLength(steps[first])
 	}
-	if w.owner[s.Edge] != noOwner {
-		return nil, fmt.Errorf("train %s: start block %d already owned", spec.Name, s.Edge)
+	if covered < spec.Length {
+		return nil, fmt.Errorf("train %s (%.0fm) does not fit before its start point (%.0fm of track)", spec.Name, spec.Length, covered)
 	}
 	t := &Train{ID: len(w.Trains), TrainSpec: spec, Route: route}
-	last := step == len(route.Legs[leg].Steps)-1
-	t.trail = []held{{Step: s, Stop: last, Leg: leg}}
-	t.head = w.Net.StepLength(s)
+	last := step == len(steps)-1
+	for i := first; i <= step; i++ {
+		s := steps[i]
+		if o := w.owner[w.Net.Block(s.Edge)]; o != noOwner {
+			return nil, fmt.Errorf("train %s: start block %d already owned by train %d", spec.Name, s.Edge, o)
+		}
+		t.trail = append(t.trail, held{Step: s, Stop: last && i == step, Leg: leg})
+	}
+	t.head = covered
 	t.nextLeg, t.nextStep = leg, step
 	t.advanceCursor()
 	if last {
@@ -84,9 +93,20 @@ func (w *World) AddTrain(spec TrainSpec, route Route, leg, step int) (*Train, er
 		t.Station = route.Legs[leg].Station
 		t.DwellLeft = route.Legs[leg].Dwell
 	}
-	w.owner[s.Edge] = t.ID
+	for _, h := range t.trail {
+		w.owner[w.Net.Block(h.Step.Edge)] = t.ID
+	}
 	w.Trains = append(w.Trains, t)
 	return t, nil
+}
+
+func (t *Train) holdsBlock(n *Network, b int) bool {
+	for _, h := range t.trail {
+		if n.Block(h.Step.Edge) == b {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Train) advanceCursor() {
@@ -159,10 +179,10 @@ func (w *World) reserveAhead(t *Train) {
 		}
 		leg := t.Route.Legs[t.nextLeg]
 		s := leg.Steps[t.nextStep]
-		if o := w.owner[s.Edge]; o != noOwner && o != t.ID {
+		if o := w.owner[w.Net.Block(s.Edge)]; o != noOwner && o != t.ID {
 			return
 		}
-		w.owner[s.Edge] = t.ID
+		w.owner[w.Net.Block(s.Edge)] = t.ID
 		t.trail = append(t.trail, held{Step: s, Stop: t.nextStep == len(leg.Steps)-1, Leg: t.nextLeg})
 		t.advanceCursor()
 	}
@@ -175,9 +195,12 @@ func (w *World) releaseBehind(t *Train) {
 		if t.tail() < l-positionEpsilon {
 			return
 		}
-		w.owner[t.trail[0].Step.Edge] = noOwner
+		freed := t.trail[0].Step.Edge
 		t.head -= l
 		t.trail = t.trail[1:]
+		if !t.holdsBlock(w.Net, w.Net.Block(freed)) {
+			w.owner[w.Net.Block(freed)] = noOwner
+		}
 	}
 }
 
@@ -218,7 +241,7 @@ func (w *World) depart(t *Train) {
 
 // CheckInvariants verifies the safety rules every tick-level test relies on.
 func (w *World) CheckInvariants() error {
-	physical := make(map[EdgeID]int)
+	physical := make(map[int]int)
 	for _, t := range w.Trains {
 		if t.Speed < -speedEpsilonTest || t.Speed > t.MaxSpeed+speedEpsilonTest {
 			return fmt.Errorf("train %s speed %.3f outside [0, %.3f]", t.Name, t.Speed, t.MaxSpeed)
@@ -230,15 +253,21 @@ func (w *World) CheckInvariants() error {
 			return fmt.Errorf("train %s head beyond movement authority", t.Name)
 		}
 		for _, h := range t.trail {
-			if w.owner[h.Step.Edge] != t.ID {
-				return fmt.Errorf("train %s holds block %d owned by %d", t.Name, h.Step.Edge, w.owner[h.Step.Edge])
+			if w.owner[w.Net.Block(h.Step.Edge)] != t.ID {
+				return fmt.Errorf("train %s holds block %d owned by %d", t.Name, h.Step.Edge, w.owner[w.Net.Block(h.Step.Edge)])
 			}
 		}
+		seen := map[int]bool{}
 		for _, e := range w.OccupiedEdges(t) {
-			if other, ok := physical[e]; ok {
-				return fmt.Errorf("trains %s and %s both on block %d", w.Trains[other].Name, t.Name, e)
+			b := w.Net.Block(e)
+			if seen[b] {
+				continue
 			}
-			physical[e] = t.ID
+			seen[b] = true
+			if other, ok := physical[b]; ok {
+				return fmt.Errorf("trains %s and %s both in block %d", w.Trains[other].Name, t.Name, b)
+			}
+			physical[b] = t.ID
 		}
 	}
 	return nil
@@ -269,7 +298,7 @@ func (w *World) OccupiedEdges(t *Train) []EdgeID {
 }
 
 func (w *World) BlockState(e EdgeID) BlockState {
-	o := w.owner[e]
+	o := w.owner[w.Net.Block(e)]
 	if o == noOwner {
 		return BlockFree
 	}
@@ -284,7 +313,7 @@ func (w *World) BlockState(e EdgeID) BlockState {
 // SignalGreen reports the aspect of the signal guarding entry to s: green
 // only when the block is reserved for a train that has not yet entered it.
 func (w *World) SignalGreen(s Step) bool {
-	o := w.owner[s.Edge]
+	o := w.owner[w.Net.Block(s.Edge)]
 	if o == noOwner {
 		return false
 	}

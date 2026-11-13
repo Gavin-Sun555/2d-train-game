@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	scenario := flag.Int("scenario", 1, "built-in scenario to start (1-based)")
+	demo := flag.Bool("demo", false, "start with a sample tram network")
 	shot := flag.String("shot", "", "write a PNG screenshot to this path after -frames updates, then exit")
 	frames := flag.Int("frames", 600, "updates to run before -shot")
 	warp := flag.Float64("warp", 0, "fast-forward this many simulated seconds before starting")
@@ -20,7 +20,12 @@ func main() {
 	ebiten.SetWindowSize(1280, 720)
 	ebiten.SetWindowTitle("2D Train Game")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
-	gm := game.New(*scenario - 1)
+	gm := game.New()
+	if *demo {
+		if err := gm.LoadDemo(); err != nil {
+			log.Fatal(err)
+		}
+	}
 	gm.Warp(*warp)
 	var g ebiten.Game = gm
 	if *shot != "" {
