@@ -12,7 +12,7 @@ run: build
 
 ## demo: 带示例线网启动
 demo: build
-	./$(APP_NAME) -demo
+	./$(APP_NAME) -map seattle -demo
 
 ## test: 运行模拟核心的 headless 测试
 test:

@@ -36,6 +36,7 @@ type Map struct {
 	W, H  int // tiles
 	Tiles []Tile
 	Seed  uint64
+	Lots  []Lot
 }
 
 func (m *Map) At(tx, ty int) Tile {
@@ -71,7 +72,7 @@ func isRoadLine(i int) (road, arterial bool) {
 // arterials every 24, a winding river crossed only by arterial bridges,
 // some parks, and buildings filling the remaining blocks.
 func Generate(seed uint64) *Map {
-	const w, h = 97, 61
+	const w, h = 98, 61
 	m := &Map{W: w, H: h, Tiles: make([]Tile, w*h), Seed: seed}
 	rng := rand.New(rand.NewPCG(seed, 0x7261696c))
 
@@ -114,6 +115,7 @@ func Generate(seed uint64) *Map {
 			}
 		}
 	}
+	m.buildLots(rng)
 	return m
 }
 
@@ -125,4 +127,27 @@ func RoadCentre(i int) float64 {
 		return float64(i+1) * TileSize
 	}
 	return (float64(i) + 0.5) * TileSize
+}
+
+// StreetLine is one straight street corridor running across the map.
+type StreetLine struct {
+	Tile     int     // first tile index of the corridor
+	Centre   float64 // centre line, metres
+	Arterial bool    // 2-tile corridor
+}
+
+// StreetLines lists the street corridors along an axis with n tiles.
+func StreetLines(n int) []StreetLine {
+	var out []StreetLine
+	for i := 0; i < n; i++ {
+		road, art := isRoadLine(i)
+		if !road || (art && i%arterialEvery == 1) {
+			continue
+		}
+		if art && i+1 >= n {
+			art = false // a half arterial at the map edge is just a street
+		}
+		out = append(out, StreetLine{Tile: i, Centre: RoadCentre(i), Arterial: art})
+	}
+	return out
 }
