@@ -16,20 +16,48 @@ const (
 func vec(p mapdata.Pt) Vec { return Vec{X: p[0], Y: p[1]} }
 
 // FromMap builds the street network from imported real-world roads.
-func FromMap(m *mapdata.Map) *Network {
+func FromMap(m *mapdata.Map) *Network { return fromMap(m, false) }
+
+// FromMapLegacy builds the network as versions before road levels and ramp
+// junctions did (used to read saves made then).
+func FromMapLegacy(m *mapdata.Map) *Network { return fromMap(m, true) }
+
+func fromMap(m *mapdata.Map, legacy bool) *Network {
 	n := &Network{Stops: map[StopID]*Stop{}, Lines: map[LineID]*Line{}}
 
-	// Nodes shared by several roads, and road ends, are crossings.
+	// Nodes shared by several roads, and road ends, are crossings; so are
+	// the street nodes where motorway ramps join ("gates").
 	use := make([]int, len(m.Nodes))
 	cross := make([]bool, len(m.Nodes))
+	// levels: the levels of the roads through each node, as bits; nodes
+	// only merge into one junction when they share a level, so a bridge
+	// never joins the street it passes over.
+	levels := make([]uint8, len(m.Nodes))
 	for _, r := range m.Roads {
 		for _, id := range r.Nodes {
 			use[id]++
+			if legacy {
+				levels[id] = 1
+			} else {
+				levels[id] |= 1 << (min(max(r.Layer, -2), 2) + 2)
+			}
 		}
 		cross[r.Nodes[0]], cross[r.Nodes[len(r.Nodes)-1]] = true, true
 	}
 	for i, u := range use {
 		cross[i] = cross[i] || u > 1
+	}
+	gate := map[int]bool{}
+	highways := m.Highways
+	if legacy {
+		highways = nil
+	}
+	for _, h := range highways {
+		for _, id := range h.Nodes {
+			if use[id] > 0 {
+				cross[id], gate[id] = true, true
+			}
+		}
 	}
 
 	// Split roads at crossings and straighten each piece.
@@ -86,6 +114,9 @@ func FromMap(m *mapdata.Map) *Network {
 		for y := x + 1; y < len(kept); y++ {
 			a, b := kept[x], kept[y]
 			d := dist(vec(m.Nodes[a]), vec(m.Nodes[b]))
+			if levels[a]&levels[b] == 0 {
+				continue
+			}
 			if (cross[a] && cross[b] && d < clusterDist) || d < bendDist {
 				union(a, b)
 			}
@@ -157,9 +188,16 @@ func FromMap(m *mapdata.Map) *Network {
 		if classRank(r.Class) > classRank(p.road.Class) {
 			p.road.Class, p.road.Name = r.Class, r.Name
 		}
+		if abs(r.Layer) > abs(p.road.Layer) {
+			p.road.Layer = r.Layer
+		}
 		p.fwd, p.bck = max(p.fwd, f), max(p.bck, b)
 	}
 
+	n.anchors = map[Vec]bool{}
+	for id := range gate {
+		n.anchors[pos[find(id)]] = true
+	}
 	jid := map[int]JunctionID{}
 	junction := func(c int) JunctionID {
 		if id, ok := jid[c]; ok {
@@ -186,7 +224,7 @@ func FromMap(m *mapdata.Map) *Network {
 			a, bj, f, b = bj, a, b, 0
 		}
 		n.Roads = append(n.Roads, Road{ID: RoadID(len(n.Roads)), A: a, B: bj, Class: class,
-			Name: p.road.Name, Fwd: f, Back: b})
+			Name: p.road.Name, Fwd: f, Back: b, Level: min(max(p.road.Layer, -2), 2)})
 	}
 	n.pruneDeadEnds()
 	n.keepLargestComponent()
@@ -198,7 +236,8 @@ func FromMap(m *mapdata.Map) *Network {
 		trapped := map[RoadID]bool{}
 		for i := range n.Links {
 			l := &n.Links[i]
-			if l.Kind == LaneLink && l.Modes&Car != 0 && len(l.Next) == 0 && n.Roads[l.Road].OneWay() {
+			if l.Kind == LaneLink && l.Modes&Car != 0 && len(l.Next) == 0 && n.Roads[l.Road].OneWay() &&
+				!n.anchors[n.Junctions[n.Roads[l.Road].B].Pos] {
 				trapped[l.Road] = true
 			}
 		}
@@ -216,7 +255,25 @@ func FromMap(m *mapdata.Map) *Network {
 		n.keepLargestComponent()
 		n.Rebuild()
 	}
+	// Where each ramp meets the streets.
+	at := map[Vec]JunctionID{}
+	for _, j := range n.Junctions {
+		at[j.Pos] = j.ID
+	}
+	n.Gates = map[int]JunctionID{}
+	for id := range gate {
+		if j, ok := at[pos[find(id)]]; ok && len(n.RoadsAt(j)) > 0 {
+			n.Gates[id] = j
+		}
+	}
 	return n
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
 }
 
 func classRank(c string) int {
@@ -262,7 +319,9 @@ func simplify(m *mapdata.Map, piece []int) []int {
 	if far < simplifyTol {
 		return []int{piece[0], piece[len(piece)-1]}
 	}
-	left := simplify(m, piece[:at+1])
+	// Copy: piece shares memory with the map's road, which must not change
+	// (the network is built from it again for every save that is read).
+	left := append([]int(nil), simplify(m, piece[:at+1])...)
 	return append(left[:len(left)-1], simplify(m, piece[at:])...)
 }
 

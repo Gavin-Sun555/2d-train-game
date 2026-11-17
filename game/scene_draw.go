@@ -1,6 +1,7 @@
 package game
 
 import (
+	"github.com/Gavin-Sun555/2d-train-game/internal/locale"
 	"math"
 	"sort"
 
@@ -58,7 +59,10 @@ type scene struct {
 	src       *mapdata.Map
 	areas     []area
 	buildings []building
-	trees     []street.Vec
+	trees     []street.Vec // where trees stand (see trees.go)
+	mapTrees  []street.Vec // trees as mapped
+	highways  []highway
+	landmarks []landmark
 }
 
 func newScene(m *mapdata.Map) *scene {
@@ -96,8 +100,10 @@ func newScene(m *mapdata.Map) *scene {
 		}
 		s.buildings = append(s.buildings, bd)
 	}
+	s.highways = newHighways(m)
+	s.landmarks = newLandmarks(m)
 	for _, t := range m.Trees {
-		s.trees = append(s.trees, street.Vec{X: t[0], Y: t[1]})
+		s.mapTrees = append(s.mapTrees, street.Vec{X: t[0], Y: t[1]})
 	}
 	return s
 }
@@ -115,7 +121,17 @@ func (c *canvas) meshVisible(m *mesh, pad float64) bool {
 // sunShadow is the shadow offset per metre of building height (the sun in
 // the south-west, shadows falling to the north-east... drawn to the lower
 // right to match the vehicles).
-var sunShadow = street.Vec{X: 0.32, Y: 0.42}
+var sunShadow = street.Vec{X: 0.16, Y: 0.21}
+
+// Building shadows are drawn as one flat layer: overlapping shadows never
+// darken each other, and a tall tower's shadow stays light enough to see
+// the track and trams in it.
+const (
+	shadowCap   = 90.0 // m: towers taller than this cast no longer shadows
+	shadowAlpha = 0.2
+)
+
+var colShadowTone = rgb(24, 34, 52)
 
 func (g *Game) drawSceneGround(c *canvas) {
 	for i := range g.scene.areas {
@@ -126,22 +142,37 @@ func (g *Game) drawSceneGround(c *canvas) {
 	}
 }
 
-func (g *Game) drawSceneBuildings(c *canvas) {
-	bs := g.scene.buildings
-	// Shadows: the footprint swept along the sun direction.
-	for i := range bs {
-		b := &bs[i]
-		off := scale(sunShadow, math.Min(b.height, 160))
+// drawSceneShadows lays the building shadows over the ground, streets and
+// track (but under vehicles and roofs) as a single translucent layer.
+func (g *Game) drawSceneShadows(dst *ebiten.Image) {
+	w, h := dst.Bounds().Dx(), dst.Bounds().Dy()
+	if g.shadowImg == nil || g.shadowImg.Bounds().Dx() != w || g.shadowImg.Bounds().Dy() != h {
+		g.shadowImg = ebiten.NewImage(w, h)
+	}
+	g.shadowImg.Clear()
+	c := newCanvas(g.shadowImg, g)
+	// The footprint swept along the sun direction.
+	for i := range g.scene.buildings {
+		b := &g.scene.buildings[i]
+		off := scale(sunShadow, math.Min(b.height, shadowCap))
 		if !c.visible(b.m.box[0], b.m.box[1], b.m.box[2]+off.X, b.m.box[3]+off.Y) {
 			continue
 		}
-		c.trisAt(b.m.pts, b.m.tris, off, colBShadow)
+		c.trisAt(b.m.pts, b.m.tris, off, colShadowTone)
 		n := len(b.m.pts)
 		for k := 0; k < n; k++ {
 			p, q := b.m.pts[k], b.m.pts[(k+1)%n]
-			c.fan([]street.Vec{p, q, add(q, off), add(p, off)}, colBShadow)
+			c.fan([]street.Vec{p, q, add(q, off), add(p, off)}, colShadowTone)
 		}
 	}
+	c.flush()
+	op := &ebiten.DrawImageOptions{}
+	op.ColorScale.ScaleAlpha(shadowAlpha)
+	dst.DrawImage(g.shadowImg, op)
+}
+
+func (g *Game) drawSceneBuildings(c *canvas) {
+	bs := g.scene.buildings
 	detail := c.px() > 1.4
 	for i := range bs {
 		b := &bs[i]
@@ -203,7 +234,7 @@ func (g *Game) band(c *canvas, r street.RoadID, left, right float64, col colorT)
 	c.fan([]street.Vec{add(a, scale(rt, right)), add(b, scale(rt, right)), sub(b, scale(rt, left)), sub(a, scale(rt, left))}, col)
 }
 
-// junctionHull is the paved area where roads meet, widened by extra.
+// junctionHull is the paved area where car streets meet, widened by extra.
 func (g *Game) junctionHull(j street.JunctionID, extra float64) []street.Vec {
 	n := g.net
 	c := n.Junctions[j].Pos
@@ -211,6 +242,9 @@ func (g *Game) junctionHull(j street.JunctionID, extra float64) []street.Vec {
 	var pts []street.Vec
 	for _, r := range n.RoadsAt(j) {
 		rd := n.Roads[r]
+		if rd.Tramway {
+			continue
+		}
 		a, b, d, rt := g.roadFrame(r)
 		_ = b
 		left, right := rd.Sides()
@@ -229,8 +263,10 @@ func (g *Game) junctionHull(j street.JunctionID, extra float64) []street.Vec {
 
 func (g *Game) drawRealStreets(c *canvas) {
 	n := g.net
-	vis := func(r street.RoadID) bool { return g.roadVisible(c, r) }
-	jvis := func(j street.Junction) bool { return c.visibleAround(j.Pos, n.Radius(j.ID)+25) }
+	vis := func(r street.RoadID) bool { return !n.Roads[r].Tramway && g.roadVisible(c, r) }
+	jvis := func(j street.Junction) bool {
+		return j.Level == 0 && g.hasStreetAt(j.ID) && c.visibleAround(j.Pos, n.Radius(j.ID)+25)
+	}
 	// Sidewalks and kerbs.
 	for _, rd := range n.Roads {
 		if vis(rd.ID) {
@@ -241,12 +277,18 @@ func (g *Game) drawRealStreets(c *canvas) {
 	for _, j := range n.Junctions {
 		if jvis(j) {
 			c.fan(g.junctionHull(j.ID, sidewalkWidth), colSidewalk)
+			g.jointTapers(c, j.ID, sidewalkWidth, colSidewalk)
 		}
 	}
 	for _, rd := range n.Roads {
 		if vis(rd.ID) {
 			l, r := rd.Sides()
 			g.band(c, rd.ID, l+0.3, r+0.3, colKerb)
+		}
+	}
+	for _, j := range n.Junctions {
+		if jvis(j) {
+			g.jointTapers(c, j.ID, 0.3, colKerb)
 		}
 	}
 	// Carriageways.
@@ -258,7 +300,12 @@ func (g *Game) drawRealStreets(c *canvas) {
 	}
 	for _, j := range n.Junctions {
 		if jvis(j) {
-			c.fan(g.junctionHull(j.ID, 0), colRoadJoint)
+			col := colRoadJoint
+			if len(n.RoadsAt(j.ID)) <= 2 {
+				col = colRoad // a bend, not a crossing: no patch
+			}
+			c.fan(g.junctionHull(j.ID, 0), col)
+			g.jointTapers(c, j.ID, 0, colRoad)
 		}
 	}
 	if c.px() < 0.45 {
@@ -267,6 +314,26 @@ func (g *Game) drawRealStreets(c *canvas) {
 	for _, rd := range n.Roads {
 		if vis(rd.ID) {
 			g.drawLaneLines(c, rd)
+		}
+	}
+	for _, j := range n.Junctions {
+		if jvis(j) && len(n.RoadsAt(j.ID)) == 2 {
+			g.drawBendJoin(c, j.ID)
+		}
+	}
+	// Track bed of own-right-of-way track through bends.
+	for i := range n.Links {
+		l := &n.Links[i]
+		if !g.bendTrack(l) || !c.visibleAround(l.Pts[0], l.Length+5) {
+			continue
+		}
+		w := street.LaneWidth - 0.5
+		if l.Centre {
+			w = n.Roads[n.Links[l.From].Road].CentreGap() - 0.2
+		}
+		c.polyline(l.Pts, w, 1, colTrackBed)
+		for _, p := range l.Pts {
+			c.circle(p, w/2, colTrackBed)
 		}
 	}
 	for _, rd := range n.Roads {
@@ -424,7 +491,7 @@ func (g *Game) drawAttribution(dst *ebiten.Image) {
 	if g.scene == nil {
 		return
 	}
-	s := "地图数据 © OpenStreetMap contributors"
+	s := locale.T("地图数据 © OpenStreetMap contributors", "Map data © OpenStreetMap contributors")
 	const size = 10
 	w, _ := textui.MeasureText(s, size)
 	x, y := float64(g.w)-w-10, float64(g.h)-86
@@ -432,4 +499,139 @@ func (g *Game) drawAttribution(dst *ebiten.Image) {
 		textui.DrawText(dst, s, x+o[0], y+o[1], size, rgba(90, 90, 90, 90)) // premultiplied: white at 35%
 	}
 	textui.DrawText(dst, s, x, y, size, rgb(40, 42, 46))
+}
+
+// sidesOut is a road's carriageway width left and right of its centre line,
+// looking away from junction j along it.
+func sidesOut(n *street.Network, r street.RoadID, j street.JunctionID) (left, right float64) {
+	rd := n.Roads[r]
+	l, rt := rd.Sides()
+	if rd.A == j {
+		return l, rt
+	}
+	return rt, l
+}
+
+func (g *Game) streetRoadsAt(j street.JunctionID) []street.RoadID {
+	var out []street.RoadID
+	for _, r := range g.net.RoadsAt(j) {
+		if !g.net.Roads[r].Tramway {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// jointTapers smooths the step where a street changes width at a plain
+// joint (two streets, no crossing): the wider side narrows into the other
+// road over a short taper instead of ending square.
+func (g *Game) jointTapers(c *canvas, j street.JunctionID, extra float64, col colorT) {
+	n := g.net
+	rs := g.streetRoadsAt(j)
+	if len(rs) != 2 {
+		return
+	}
+	at := n.Junctions[j].Pos
+	out := func(r street.RoadID) (street.Vec, float64) {
+		a, b := n.Ends(r)
+		if n.Roads[r].B == j {
+			a, b = b, a
+		}
+		return unit(sub(b, a)), dist(a, b)
+	}
+	rightN := func(d street.Vec) street.Vec { return street.Vec{X: -d.Y, Y: d.X} }
+	leftN := func(d street.Vec) street.Vec { return street.Vec{X: d.Y, Y: -d.X} }
+	d0, len0 := out(rs[0])
+	d1, len1 := out(rs[1])
+	l0, r0 := sidesOut(n, rs[0], j)
+	l1, r1 := sidesOut(n, rs[1], j)
+	// Travelling from road 0 into road 1: its left kerb is road 0's
+	// outward right, and its right kerb road 0's outward left.
+	sides := []struct {
+		w0, w1 float64
+		n0, n1 street.Vec
+	}{
+		{r0, l1, rightN(d0), leftN(d1)},
+		{l0, r1, leftN(d0), rightN(d1)},
+	}
+	for _, s := range sides {
+		w0, w1 := s.w0+extra, s.w1+extra
+		switch {
+		case w0 > w1+0.3:
+			t := math.Min(15, 0.4*len1)
+			edge := add(at, scale(s.n1, w1))
+			c.fan([]street.Vec{add(at, scale(s.n0, w0)), add(edge, scale(d1, t)), edge}, col)
+		case w1 > w0+0.3:
+			t := math.Min(15, 0.4*len0)
+			edge := add(at, scale(s.n0, w0))
+			c.fan([]street.Vec{add(at, scale(s.n1, w1)), add(edge, scale(d0, t)), edge}, col)
+		}
+	}
+}
+
+// bendTrack reports whether a connector is ground tram track with its own right
+// of way carried through a bend in the road (a joint of two roads, not a
+// crossing).
+func (g *Game) bendTrack(l *street.Link) bool {
+	n := g.net
+	if l.Kind != street.ConnectorLink || l.Modes&street.Tram == 0 || len(n.RoadsAt(l.Junction)) > 2 || n.Junctions[l.Junction].Level != 0 {
+		return false
+	}
+	from, to := &n.Links[l.From], &n.Links[l.To]
+	return from.Modes == street.Tram && to.Modes == street.Tram && from.Track && to.Track
+}
+
+// centreEnd is where a two-way road's centre line ends at junction j.
+func (g *Game) centreEnd(r street.RoadID, j street.JunctionID) (street.Vec, bool) {
+	n := g.net
+	rd := n.Roads[r]
+	if rd.OneWay() {
+		return street.Vec{}, false
+	}
+	ps := n.LanePieces(r, true, 0)
+	if len(ps) == 0 {
+		return street.Vec{}, false
+	}
+	first, last := &n.Links[ps[0]], &n.Links[ps[len(ps)-1]]
+	p0, p1 := first.Pts[0], last.Pts[len(last.Pts)-1]
+	d := unit(sub(p1, p0))
+	right := street.Vec{X: -d.Y, Y: d.X}
+	centre := scale(right, -rd.LaneOffset(true, 0))
+	if rd.A == j {
+		return add(p0, centre), true
+	}
+	return add(p1, centre), true
+}
+
+// drawBendJoin carries a road's centre markings through a bend, so a
+// gently kinked street reads as one continuous street.
+func (g *Game) drawBendJoin(c *canvas, j street.JunctionID) {
+	n := g.net
+	// Centre line, median or single-track strip.
+	rs := g.streetRoadsAt(j)
+	if len(rs) != 2 {
+		return
+	}
+	a, b := n.Roads[rs[0]], n.Roads[rs[1]]
+	pa, okA := g.centreEnd(a.ID, j)
+	pb, okB := g.centreEnd(b.ID, j)
+	if !okA || !okB {
+		return
+	}
+	single := func(rd street.Road) bool { return rd.Tram != street.NoTram && rd.Single }
+	switch {
+	case single(a) && single(b):
+		c.seg(pa, pb, math.Min(a.CentreGap(), b.CentreGap())-0.2, 1, colTrackBed)
+	case !single(a) && !single(b) && a.Class.Median() > 0 && b.Class.Median() > 0:
+		m := math.Min(a.Class.Median(), b.Class.Median())
+		c.seg(pa, pb, m-0.2, 1, colKerb)
+		c.seg(pa, pb, m-0.8, 1, areaColours["grass"])
+	case !single(a) && !single(b) && a.Class.Median() == 0 && b.Class.Median() == 0:
+		d := unit(sub(pb, pa))
+		right := street.Vec{X: -d.Y, Y: d.X}
+		for _, s := range []float64{-0.18, 0.18} {
+			o := scale(right, s)
+			c.seg(add(pa, o), add(pb, o), 0.12, 1, colCentreY)
+		}
+	}
 }

@@ -2,6 +2,7 @@ package game
 
 import (
 	"fmt"
+	"github.com/Gavin-Sun555/2d-train-game/internal/locale"
 	"image/color"
 	"math"
 	"strings"
@@ -10,9 +11,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/vector"
 
-	"github.com/Gavin-Sun555/2d-train-game/build"
 	"github.com/Gavin-Sun555/2d-train-game/internal/textui"
-	"github.com/Gavin-Sun555/2d-train-game/rail/sim"
 	"github.com/Gavin-Sun555/2d-train-game/street"
 	"github.com/Gavin-Sun555/2d-train-game/traffic"
 )
@@ -35,7 +34,7 @@ func (g *Game) setPage(p page) {
 	if p == g.page {
 		return
 	}
-	g.page, g.start, g.pending = p, -1, nil
+	g.page, g.start, g.anchor, g.pending, g.modelMenu = p, -1, nil, nil, nil
 	if p == pageRun && g.dirty {
 		g.rebuild()
 	}
@@ -65,8 +64,8 @@ func (g *Game) updateKeys() {
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 		switch {
-		case g.start >= 0 || len(g.pending) > 0:
-			g.start, g.pending = -1, nil
+		case g.anchor != nil || g.start >= 0 || len(g.pending) > 0:
+			g.anchor, g.start, g.pending = nil, -1, nil
 		case g.follow != 0:
 			g.follow = 0
 		case g.selLine >= 0:
@@ -78,22 +77,28 @@ func (g *Game) updateKeys() {
 
 	switch g.page {
 	case pageBuild:
-		for i := range toolNames {
+		for i := range toolNames() {
 			if inpututil.IsKeyJustPressed(ebiten.Key1 + ebiten.Key(i)) {
-				g.tool, g.start = tool(i), -1
+				g.tool, g.start, g.anchor = tool(i), -1, nil
 			}
 		}
 		switch {
+		case g.tool == toolStop && inpututil.IsKeyJustPressed(ebiten.KeyBracketRight):
+			g.platformLength(1)
+		case g.tool == toolStop && inpututil.IsKeyJustPressed(ebiten.KeyBracketLeft):
+			g.platformLength(-1)
 		case inpututil.IsKeyJustPressed(ebiten.KeyM):
-			g.layout = (g.layout + 1) % len(layouts)
-			g.say("轨道形式：%s", layouts[g.layout].name)
+			g.setLayout((g.layout + 1) % len(layouts))
 		case inpututil.IsKeyJustPressed(ebiten.KeyL):
-			next := (g.level + 1) % len(levels)
-			if !build.Rules[levels[next]].Buildable || levels[next] != sim.Ground {
-				g.say("%s线路（轻轨 / 地铁）将在以后的版本开放", levelNames[next])
-				return
+			// Cycle smoothly through the three buildable levels: Ground (0) -> Elevated (+1) -> Underground (-1).
+			switch g.level {
+			case groundLevel:
+				g.setLevel(1) // Elevated (+1)
+			case 1:
+				g.setLevel(3) // Underground (-1)
+			default:
+				g.setLevel(groundLevel) // Ground (0)
 			}
-			g.level = next
 		}
 	case pagePlan:
 		switch {
@@ -105,25 +110,24 @@ func (g *Game) updateKeys() {
 			g.configure(0, 1)
 		case inpututil.IsKeyJustPressed(ebiten.KeyBracketLeft):
 			g.configure(0, -1)
+		case inpututil.IsKeyJustPressed(ebiten.KeyPeriod):
+			g.configureLoad(1)
+		case inpututil.IsKeyJustPressed(ebiten.KeyComma):
+			g.configureLoad(-1)
 		case inpututil.IsKeyJustPressed(ebiten.KeyEnter):
 			g.commitLine()
+		case inpututil.IsKeyJustPressed(ebiten.KeyN):
+			if st, ok := g.hoverStop(); ok {
+				g.openStopRename(st.ID)
+			} else {
+				g.say("%s", locale.T("把鼠标指向一个车站再按 N 改站名（或点击站名标签）", "Point at a stop and press N to rename it (or click its name label)"))
+			}
 		case inpututil.IsKeyJustPressed(ebiten.KeyBackspace), inpututil.IsKeyJustPressed(ebiten.KeyDelete):
 			if len(g.pending) > 0 {
 				g.pending = g.pending[:len(g.pending)-1]
 				return
 			}
-			id := g.selLine
-			if id < 0 {
-				if ids := g.net.LineIDs(); len(ids) > 0 {
-					id = ids[len(ids)-1]
-				}
-			}
-			if _, ok := g.net.Lines[id]; ok {
-				g.say("已删除 %d 路", g.lineIndex(id)+1)
-				g.net.DeleteLine(id)
-				g.selLine = -1
-				g.edited()
-			}
+			g.deleteLine()
 		}
 	case pageRun:
 		switch {
@@ -134,12 +138,28 @@ func (g *Game) updateKeys() {
 		case inpututil.IsKeyJustPressed(ebiten.KeyMinus), inpututil.IsKeyJustPressed(ebiten.KeyKPSubtract):
 			g.speedIdx = max(g.speedIdx-1, 0)
 		case inpututil.IsKeyJustPressed(ebiten.KeyC):
-			g.densityIdx = (g.densityIdx + 1) % len(densities)
-			g.sim.TargetCars = densities[g.densityIdx]
-			g.say("汽车数量：%d", densities[g.densityIdx])
+			g.setDensity((g.densityIdx + 1) % len(densities))
 		case inpututil.IsKeyJustPressed(ebiten.KeyF):
 			g.followNext()
+		case inpututil.IsKeyJustPressed(ebiten.KeyP):
+			g.setPassengers((g.passIdx + 1) % len(traffic.PassengerRates))
 		}
+	}
+}
+
+// deleteLine deletes the selected line, or else the newest one.
+func (g *Game) deleteLine() {
+	id := g.selLine
+	if id < 0 {
+		if ids := g.net.LineIDs(); len(ids) > 0 {
+			id = ids[len(ids)-1]
+		}
+	}
+	if _, ok := g.net.Lines[id]; ok {
+		g.say(locale.T("已删除 %d 路", "Deleted line %d"), g.lineIndex(id)+1)
+		g.net.DeleteLine(id)
+		g.selLine = -1
+		g.edited()
 	}
 }
 
@@ -148,8 +168,39 @@ func (g *Game) hoverJunction() (street.JunctionID, bool) {
 	return g.net.NearestJunction(g.cursor, math.Max(g.pick(14), 12))
 }
 
+// hoverStop is the stop under the cursor, if any.
+func (g *Game) hoverStop() (*street.Stop, bool) {
+	if g.page == pageBuild {
+		return g.net.StopNearAt(g.cursor, levelHeight(g.level), math.Max(g.pick(16), 20))
+	}
+	return g.net.StopNear(g.cursor, math.Max(g.pick(16), 20))
+}
+
+// platformLength lengthens or shortens the platform of the stop under the
+// cursor, or else the platform new stops get.
+func (g *Game) platformLength(d int) {
+	if st, ok := g.hoverStop(); ok {
+		k := min(max(st.Capacity()+d, street.MinSections), street.MaxSections)
+		if k == st.Capacity() {
+			return
+		}
+		if err := g.net.SetStopSections(st.ID, k); err != nil {
+			g.say(locale.T("%s 站台无法改为 %d 节：%v", "%s: the platform can't hold %d sections: %v"), st.Name, k, err)
+			return
+		}
+		g.edited()
+		g.say(locale.T("%s：站台 %d 节（%.0f m）", "%s: platform %d sections (%.0f m)"), st.Name, k, street.SetLength(k))
+		return
+	}
+	g.platform = min(max(g.platform+d, street.MinSections), street.MaxSections)
+	g.say(locale.T("新车站的站台：%d 节（%.0f m）", "New stops get platforms for %d sections (%.0f m)"), g.platform, street.SetLength(g.platform))
+}
+
 // trackPreview is what a left click with the track tool would lay.
 func (g *Game) trackPreview() []street.RoadID {
+	if _, ok := g.onHighway(); ok {
+		return nil
+	}
 	if j, ok := g.hoverJunction(); ok {
 		if g.start >= 0 && j != g.start {
 			p, _ := g.net.RoadPath(g.start, j)
@@ -168,10 +219,13 @@ func (g *Game) updateTool() {
 	right := inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight)
 	if left {
 		mx, my := ebiten.CursorPosition()
+		if g.landmarkClicked(mx, my) || g.stopLabelClicked(mx, my) {
+			return
+		}
 		if g.page == pagePlan {
 			for _, b := range g.cfgBtns {
 				if b.r.has(mx, my) {
-					g.configure(b.dTrams, b.dSections)
+					b.act()
 					return
 				}
 			}
@@ -198,7 +252,7 @@ func (g *Game) updateTool() {
 		}
 		st, ok := g.net.StopNear(g.cursor, math.Max(g.pick(16), 20))
 		if !ok {
-			g.say("依次点击车站，然后按回车建线")
+			g.say("%s", locale.T("依次点击车站，然后按回车建线", "Click stops in order, then press Enter to build the line"))
 			return
 		}
 		if n := len(g.pending); n == 0 || g.pending[n-1] != st.ID {
@@ -214,40 +268,84 @@ func (g *Game) updateTool() {
 }
 
 func (g *Game) buildTool(left, right bool) {
-	switch g.tool {
-	case toolTrack:
-		if right {
-			g.start = -1
+	if !levelOpen(g.level) {
+		if left {
+			g.say(locale.T("%s暂不能建设：%s（L 或右下角回到地面层）", "Nothing can be built on the %s yet: %s (L or the bottom right goes back to the ground)"), levelNames()[g.level], levelHints()[g.level])
 		}
-		if !left {
+		return
+	}
+	if g.tool == toolRoad {
+		if levelHeight(g.level) != 0 {
+			if left {
+				g.say("%s", locale.T("汽车道路只能在地面层建设（按 L 切回地面层）", "Car streets can only be built on the Ground level (press L for Ground)"))
+			}
 			return
 		}
-		roads := g.trackPreview()
-		if j, ok := g.hoverJunction(); ok {
-			g.start = j
+		g.roadTool(left, right)
+		return
+	}
+	curLv := levelHeight(g.level)
+	if curLv == 0 {
+		if _, ok := g.onHighway(); ok && left && g.tool != toolRemove && g.tool != toolTrack {
+			g.say("%s", highwayRefusal())
+			return
 		}
-		if len(roads) > 0 {
-			g.net.SetTram(roads, layouts[g.layout].mode, layouts[g.layout].single)
-			g.edited()
-		}
+	}
+	switch g.tool {
+	case toolTrack:
+		g.buildTrackTool(left, right)
 	case toolStop:
 		if !left {
 			return
 		}
-		r, t, ok := g.net.NearestRoad(g.cursor, g.pick(14))
+		r, t, ok := g.net.NearestRoadAt(g.cursor, curLv, g.pick(14))
 		if !ok {
 			return
 		}
-		if _, err := g.net.AddStop(r, t); err != nil {
-			g.say("无法设站：%v", err)
+		if st, ok := g.hoverStop(); ok {
+			g.say(locale.T("%s：站台 %d 节（%.0f m），按 [ ] 调整", "%s: platform %d sections (%.0f m), [ ] to change"), st.Name, st.Capacity(), street.SetLength(st.Capacity()))
+			return
+		}
+		if _, err := g.net.AddStop(r, t, g.platform); err != nil {
+			g.say(locale.T("无法设站：%v", "Can't place a stop: %v"), err)
 			return
 		}
 		g.edited()
+	case toolCrossover:
+		if !left {
+			return
+		}
+		r, t, ok := g.net.NearestRoadAt(g.cursor, curLv, g.pick(12))
+		if !ok {
+			return
+		}
+		if err := g.net.AddCrossover(r, t); err != nil {
+			g.say(locale.T("无法建渡线：%v", "Can't build a crossover: %v"), err)
+			return
+		}
+		g.edited()
+		g.say("%s", locale.T("已建渡线：电车可以在这里换到另一条轨道、折返", "Crossover built: trams can switch tracks and turn back here"))
 	case toolRemove:
 		if !left {
 			return
 		}
-		if r, _, ok := g.net.NearestRoad(g.cursor, g.pick(12)); ok && g.net.Roads[r].Tram != street.NoTram {
+		if r, t, ok := g.net.CrossoverAtLevel(g.cursor, curLv, math.Max(g.pick(14), street.CrossoverLength/2)); ok {
+			g.net.RemoveCrossover(r, t, 1)
+			g.edited()
+			g.say("%s", locale.T("已拆除渡线", "Crossover removed"))
+			return
+		}
+		if r, _, ok := g.net.NearestRoadAt(g.cursor, curLv, g.pick(12)); ok && g.net.Roads[r].Tram != street.NoTram {
+			if g.net.Roads[r].Tramway {
+				if err := g.net.RemoveTramway(r); err != nil {
+					g.say("%v", err)
+					return
+				}
+				g.anchor, g.start = nil, -1
+				g.edited()
+				g.say("%s", locale.T("已拆除独立轨道段", "Removed tramway segment"))
+				return
+			}
 			g.net.SetTram([]street.RoadID{r}, street.NoTram, false)
 			g.edited()
 		}
@@ -257,13 +355,13 @@ func (g *Game) buildTool(left, right bool) {
 func (g *Game) commitLine() {
 	id, err := g.net.AddLine(g.pending)
 	if err != nil {
-		g.say("无法建线：%v", err)
+		g.say(locale.T("无法建线：%v", "Can't build the line: %v"), err)
 		return
 	}
 	g.pending = nil
 	g.selLine = id
 	g.edited()
-	g.say("已建立 %d 路，切换到「运行」开始运营", g.lineIndex(id)+1)
+	g.say(locale.T("已建立 %d 路，切换到「运行」开始运营", "Line %d built; switch to Run to start the service"), g.lineIndex(id)+1)
 }
 
 func (g *Game) legendClick(id street.LineID) {
@@ -322,7 +420,7 @@ func (g *Game) followNext() {
 		}
 	}
 	if len(trams) == 0 {
-		g.say("还没有电车：先在「规划」页建线")
+		g.say("%s", locale.T("还没有电车：先在「规划」页建线", "No trams yet: build a line on the Plan page first"))
 		return
 	}
 	next := trams[0]
@@ -352,8 +450,9 @@ func (g *Game) updateFollow() {
 		return
 	}
 	mid, _ := along(pts, v.Length/2)
-	g.camX += (mid.X - g.camX) * 0.18
-	g.camY += (mid.Y - g.camY) * 0.18
+	k := math.Min(0.65, 0.18*math.Max(1, g.zoom/8))
+	g.camX += (mid.X - g.camX) * k
+	g.camY += (mid.Y - g.camY) * k
 }
 
 // --- planning ---------------------------------------------------------------
@@ -373,16 +472,23 @@ func (g *Game) lineRoutes() map[street.LineID][][]street.Vec {
 		}
 		calls := l.Calls()
 		for i := 1; i <= len(calls); i++ {
-			path, p, ok := n.TramRoute(cur.Link, cur.Pos, calls[i%len(calls)])
+			path, p, ok := n.TramRoute(cur.Link, cur.Head(n.TramLength(l)), calls[i%len(calls)], n.TramLength(l), calls[(i+1)%len(calls)])
 			if !ok {
 				break
 			}
 			var pts []street.Vec
+			length := n.TramLength(l)
+			start := cur.Pos
+			if len(path) > 1 && n.Links[path[0]].Twin == path[1] && n.TurnsInPlace(path[0], cur.Head(length), length) {
+				// Changes ends at the platform: draw from its tail onwards.
+				start = n.Links[path[1]].Length - (cur.Head(length) - length)
+				path = path[1:]
+			}
 			for k, lid := range path {
 				lk := &n.Links[lid]
 				from, to := 0.0, lk.Length
 				if k == 0 {
-					from = cur.Pos
+					from = start
 				}
 				if k == len(path)-1 {
 					to = p.Pos
@@ -399,20 +505,60 @@ func (g *Game) lineRoutes() map[street.LineID][][]street.Vec {
 // --- overlays ---------------------------------------------------------------
 
 func (g *Game) drawToolOverlay(c *canvas) {
+	if !levelOpen(g.level) {
+		return
+	}
 	switch g.page {
 	case pageBuild:
+		curLv := levelHeight(g.level)
+		// Built crossovers on this level, so they are easy to find.
+		for _, rd := range g.net.Roads {
+			la, lb := g.net.RoadLevels(rd.ID)
+			if len(rd.Crossovers) == 0 || (la != curLv && lb != curLv) || !g.roadVisible(c, rd.ID) {
+				continue
+			}
+			a, b := g.net.Ends(rd.ID)
+			for _, t := range rd.Crossovers {
+				g.crossoverMark(c, a.Lerp(b, t), unit(sub(b, a)), rd, colAccent)
+			}
+		}
+		switch g.tool {
+		case toolRoad:
+			if curLv == 0 {
+				g.drawRoadOverlay(c)
+			}
+			return
+		case toolStop, toolCrossover:
+			if curLv == 0 {
+				if h, ok := g.onHighway(); ok {
+					g.markHighway(c, h)
+					return
+				}
+			}
+		}
 		switch g.tool {
 		case toolTrack:
-			g.highlightRoads(c, g.trackPreview(), colOK)
-			if g.start >= 0 {
-				g.ring(c, g.net.Junctions[g.start].Pos, g.net.Radius(g.start), 3, colHover)
-			}
-			if j, ok := g.hoverJunction(); ok {
-				g.ring(c, g.net.Junctions[j].Pos, g.net.Radius(j), 2, colHover)
-			}
+			g.drawTrackToolOverlay(c)
 		case toolRemove:
-			if r, _, ok := g.net.NearestRoad(g.cursor, g.pick(12)); ok && g.net.Roads[r].Tram != street.NoTram {
+			if r, t, ok := g.net.CrossoverAtLevel(g.cursor, curLv, math.Max(g.pick(14), street.CrossoverLength/2)); ok {
+				a, b := g.net.Ends(r)
+				g.ring(c, a.Lerp(b, t), street.CrossoverLength/2+3, 3, colBad)
+			} else if r, _, ok := g.net.NearestRoadAt(g.cursor, curLv, g.pick(12)); ok && g.net.Roads[r].Tram != street.NoTram {
 				g.highlightRoads(c, []street.RoadID{r}, colBad)
+			}
+		case toolCrossover:
+			if r, t, ok := g.net.NearestRoadAt(g.cursor, curLv, g.pick(12)); ok {
+				rd := g.net.Roads[r]
+				col := rgb(47, 168, 90)
+				if rd.Tram == street.NoTram || rd.Single || rd.OneWay() || g.net.IsRamp(r) {
+					col = rgb(217, 59, 59)
+				}
+				a, b := g.net.Ends(r)
+				g.crossoverMark(c, a.Lerp(b, t), unit(sub(b, a)), rd, col)
+			}
+		case toolStop:
+			if st, ok := g.hoverStop(); ok {
+				g.ring(c, g.net.StopPos(st), street.PlatformLength(st.Capacity())/2+6, 3, colHover)
 			}
 		}
 	case pagePlan:
@@ -434,13 +580,6 @@ func (g *Game) drawToolOverlay(c *canvas) {
 		for _, id := range g.pending {
 			g.ring(c, g.net.StopPos(g.net.Stops[id]), math.Max(10, 12/c.px()), 3, colHover)
 		}
-	case pageRun:
-		if v := g.sim.Find(g.follow); v != nil {
-			if pts := g.sim.Body(v); len(pts) > 0 {
-				mid, _ := along(pts, v.Length/2)
-				g.ring(c, mid, v.Length/2+4, 3, colHover)
-			}
-		}
 	}
 }
 
@@ -451,6 +590,8 @@ func text(dst *ebiten.Image, s string, x, y, size float64, col color.Color) {
 
 // drawLabels writes stop names and line-pick order over the map.
 func (g *Game) drawLabels(dst *ebiten.Image) {
+	g.stopLabels = g.stopLabels[:0]
+	g.drawLandmarks(dst)
 	if g.zoom < 0.5 {
 		return
 	}
@@ -460,10 +601,34 @@ func (g *Game) drawLabels(dst *ebiten.Image) {
 		if x < -100 || y < -40 || int(x) > g.w+100 || int(y) > g.h+40 {
 			continue
 		}
-		w, _ := textui.MeasureText(st.Name, 13)
-		vector.FillRect(dst, x-float32(w)/2-6, y-34, float32(w)+12, 20, colHUD, false)
-		vector.FillRect(dst, x-float32(w)/2-6, y-34, 3, 20, colAccent, false)
-		text(dst, st.Name, float64(x)-w/2, float64(y)-32, 13, color.White)
+		prefix := ""
+		switch g.net.StopLevel(st) {
+		case 1:
+			prefix = locale.T("[高架] ", "[Elev] ")
+		case -1:
+			prefix = locale.T("[地下] ", "[Sub] ")
+		}
+		label := prefix + st.Name
+		if g.page != pageRun {
+			label = fmt.Sprintf(locale.T("%s%s · %d节", "%s%s · %d sections"), prefix, st.Name, st.Capacity())
+		} else if n := g.sim.WaitingAt(id); n > 0 {
+			label = fmt.Sprintf(locale.T("%s%s · 候车 %d", "%s%s · %d waiting"), prefix, st.Name, n)
+		} else {
+			label = prefix + st.Name + locale.T(" · 无人候车", " · nobody waiting")
+		}
+		w, _ := textui.MeasureText(label, 13)
+		// Above the road, clear of the trams at the platforms when zoomed in.
+		up := float32(math.Max(34, (g.net.Roads[st.Road].HalfWidth()+sidewalkWidth)*g.zoom+20))
+		r := rect{x - float32(w)/2 - 6, y - up, x + float32(w)/2 + 6, y - up + 20}
+		g.stopLabels = append(g.stopLabels, stopLabel{id, r})
+		if g.page == pagePlan {
+			if mx, my := ebiten.CursorPosition(); r.has(mx, my) {
+				vector.FillRect(dst, r.x0-2, r.y0-2, r.x1-r.x0+4, r.y1-r.y0+4, colAccent, false) // clickable
+			}
+		}
+		vector.FillRect(dst, x-float32(w)/2-6, y-up, float32(w)+12, 20, colHUD, false)
+		vector.FillRect(dst, x-float32(w)/2-6, y-up, 3, 20, colAccent, false)
+		text(dst, label, float64(x)-w/2, float64(y-up)+2, 13, color.White)
 	}
 	for i, id := range g.pending {
 		x, y := g.toScreen(g.net.StopPos(g.net.Stops[id]))
@@ -476,7 +641,7 @@ func (g *Game) drawLabels(dst *ebiten.Image) {
 func (g *Game) drawHUD(dst *ebiten.Image) {
 	vector.FillRect(dst, 0, 0, float32(g.w), hudHeight, colHUD, false)
 	x := 8.0
-	for i, n := range pageNames {
+	for i, n := range pageNames() {
 		w, _ := textui.MeasureText(n, 15)
 		r := rect{float32(x), 3, float32(x + w + 24), hudHeight - 3}
 		tabRects[i] = r
@@ -489,55 +654,48 @@ func (g *Game) drawHUD(dst *ebiten.Image) {
 		}
 		x += w + 30
 	}
-	x += 12
+	g.hudBtns = g.hudBtns[:0]
+	right := g.drawHUDRight(dst)
+	x = g.drawToolbar(dst, x+12)
 	var status string
 	switch g.page {
-	case pageBuild:
-		for i, n := range toolNames {
-			label := fmt.Sprintf("%d %s", i+1, n)
-			w, _ := textui.MeasureText(label, 14)
-			col := color.Color(color.White)
-			if tool(i) == g.tool {
-				vector.FillRect(dst, float32(x-5), 6, float32(w+10), hudHeight-12, rgb(52, 64, 80), false)
-				col = colAccent
-			}
-			text(dst, label, x, 8, 14, col)
-			x += w + 18
-		}
-		status = fmt.Sprintf("轨道形式：%s (M)   层级：%s (L)", layouts[g.layout].name, levelNames[g.level])
 	case pagePlan:
-		status = fmt.Sprintf("线路 %d 条   已选车站 %d 个", len(g.net.Lines), len(g.pending))
+		status = fmt.Sprintf(locale.T("线路 %d 条", "lines: %d"), len(g.net.Lines))
 	case pageRun:
 		secs := int(g.sim.Seconds())
-		speed := fmt.Sprintf("×%d", speeds[g.speedIdx])
-		if g.paused {
-			speed = "暂停"
+		status = fmt.Sprintf(locale.T("%02d:%02d:%02d   候车 %d · 已送达 %d", "%02d:%02d:%02d   %d waiting · %d delivered"), secs/3600, secs/60%60, secs%60, g.sim.TotalWaiting(), g.sim.Passengers.Delivered)
+		if w, _ := textui.MeasureText(status, 13); x+w > right-8 {
+			status = fmt.Sprintf("%02d:%02d:%02d", secs/3600, secs/60%60, secs%60)
 		}
-		status = fmt.Sprintf("%02d:%02d:%02d %s   汽车 %d/%d (C)", secs/3600, secs/60%60, secs%60, speed, g.sim.CarCount(), g.sim.TargetCars)
 	}
-	text(dst, status, x+8, 8, 14, rgb(190, 214, 226))
+	if w, _ := textui.MeasureText(status, 13); x+w <= right-8 {
+		text(dst, status, x, 10, 13, rgb(190, 214, 226))
+	}
 
 	help := map[page]string{
-		pageBuild: "点击道路铺轨，或点击路口 → 路口沿路线铺轨；M 切换 双线独立路权 / 双线混行 / 单线；右键结束。轨道尽头自动生成渡线折返。",
-		pagePlan:  "依次点击车站，回车建线；右键撤销一站。点击左上线路选中后配置：+/- 电车数量，[ ] 编组节数，Delete 删除线路。",
-		pageRun:   "点击电车或左上线路开始跟踪（再点同一线路换下一辆），F 切换下一辆电车；空格暂停，+/- 倍速。",
+		pageBuild: locale.T("轨道：点道路直接铺轨，或在空地/路口点击起点→终点直接建线；L 切换地面/高架/地下（选起点后按 L 再点终点即建高架坡道或隧道口，右键结束），M 切换单双线。车站：[ ] 调站台长度。", "Track: click a road, or click start -> end on open ground/junctions; L switches Ground/Elevated/Underground (press L after start to build a ramp/portal, right-click ends), M track form."),
+		pagePlan:  locale.T("依次点击车站，回车建线；右键撤销一站。点击站名标签或指向车站按 N 改站名。选中左上线路后配置：+/- 电车数量，[ ] 编组节数，< > 每节载客，Delete 删除。", "Click stops in order, Enter builds the line, right-click undoes. Click a stop's label or press N on it to rename. Line at top left: +/- trams, [ ] sections, < > load."),
+		pageRun:   locale.T("点击电车或左上线路开始跟踪（再点同一线路换下一辆），F 切换下一辆电车；空格暂停，+/- 倍速，C 汽车数量，P 乘客生成速度；T 线路管理查看运营数据。", "Click a tram or a line at top left to follow it, F next tram; Space pauses, +/- speed, C cars, P passengers, T line management."),
 	}[g.page]
-	lines := []string{help, "Tab 切换 建设 / 规划 / 运行   拖动平移，双指捏合 / 滚轮缩放，WASD 平移   Esc 返回菜单"}
+	lines := []string{help, locale.T("Tab 切换 建设 / 规划 / 运行   拖动平移，双指捏合 / 滚轮缩放，WASD 平移   T 线路管理   V 声音   F5 存档 / F9 读档   Esc 返回菜单", "Tab Build / Plan / Run   Drag to pan, pinch / wheel to zoom, WASD pans   T lines   V sound   F5 save / F9 load   Esc menu")}
 	if g.msgTTL > 0 {
-		lines = append(lines, "› "+g.message)
+		lines = append(lines, "> "+g.message)
 	}
 	y := g.h - 22*len(lines) - 10
 	vector.FillRect(dst, 0, float32(y-6), float32(g.w), float32(g.h-y+6), colHUD, false)
 	for i, l := range lines {
 		col := color.Color(color.White)
-		if strings.HasPrefix(l, "›") {
+		if strings.HasPrefix(l, "> ") {
 			col = colHover
 		}
 		text(dst, l, 12, float64(y+22*i), 14, col)
 	}
+	g.drawLevelPicker(dst, float32(y-6))
 	g.drawLegend(dst)
 	g.drawLineConfig(dst)
 	g.drawFollowPanel(dst, float32(y-6))
+	g.drawDropMenu(dst)
+	g.drawSoundPanel(dst)
 }
 
 func (g *Game) drawLegend(dst *ebiten.Image) {
@@ -556,22 +714,24 @@ func (g *Game) drawLegend(dst *ebiten.Image) {
 	g.legend = g.legend[:0]
 	for i, id := range g.net.LineIDs() {
 		l := g.net.Lines[id]
-		names := make([]string, len(l.Stops))
-		for k, s := range l.Stops {
-			names[k] = g.net.Stops[s].Name
+		// Only the two ends fit: where the line's trams turn back.
+		ends := []street.StopID{l.Stops[0], l.Stops[len(l.Stops)-1]}
+		if e := l.Ends(); len(e) >= 2 {
+			ends = []street.StopID{e[0], e[len(e)-1]}
 		}
-		info := fmt.Sprintf("  %d 辆 × %d 节", g.fleet(id), l.Cars())
+		names := []string{g.net.Stops[ends[0]].Name, g.net.Stops[ends[1]].Name}
+		info := fmt.Sprintf(locale.T("  %d 辆 × %d 节", "  trams %d × sections %d"), g.fleet(id), g.cars(id))
 		if g.page == pageRun {
 			switch n := running[id]; {
 			case n == 0 && g.sim.Waiting(id) == 0:
-				info = "  ! 无电车"
+				info = locale.T("  ! 无电车", "  ! no trams")
 			case g.sim.Waiting(id) > 0:
-				info = fmt.Sprintf("  %d/%d 辆已上线", n, n+g.sim.Waiting(id))
+				info = fmt.Sprintf(locale.T("  %d/%d 辆已上线", "  in service %d/%d"), n, n+g.sim.Waiting(id))
 			default:
-				info = fmt.Sprintf("  %d 辆 · %d 运行中", n, moving[id])
+				info = fmt.Sprintf(locale.T("  %d 辆 · %d 运行中", "  trams %d · moving %d"), n, moving[id])
 			}
 		}
-		label := fmt.Sprintf("%d 路  %s%s", i+1, strings.Join(names, " – "), info)
+		label := fmt.Sprintf(locale.T("%d 路  %s%s", "Line %d  %s%s"), i+1, strings.Join(names, " – "), info)
 		w, _ := textui.MeasureText(label, 14)
 		y := float32(hudHeight + 8 + 26*i)
 		r := rect{8, y, float32(w) + 42, y + 22}
@@ -586,7 +746,8 @@ func (g *Game) drawLegend(dst *ebiten.Image) {
 	}
 }
 
-// drawFollowPanel shows the followed tram's line, speed and next stop.
+// drawFollowPanel shows the followed tram's line, model, speed and next stop,
+// with close-up zoom controls up to maxFollowZoom.
 func (g *Game) drawFollowPanel(dst *ebiten.Image, bottom float32) {
 	if g.page != pageRun || g.follow == 0 {
 		return
@@ -601,12 +762,26 @@ func (g *Game) drawFollowPanel(dst *ebiten.Image, bottom float32) {
 			stop = st.Name
 		}
 	}
-	state := fmt.Sprintf("%.0f km/h · 前往 %s", v.V*3.6, stop)
+	model := street.DefaultTramModel()
+	opMax := model.MaxSpeedKmh
+	if l := g.net.Lines[v.Line]; l != nil {
+		model = l.TramModel()
+		opMax = l.OperatingSpeedKmh()
+	}
+	state := fmt.Sprintf(locale.T("%.0f / %d km/h · 前往 %s", "%.0f / %d km/h · to %s"), v.V*3.6, opMax, stop)
 	switch {
 	case v.Reversing():
-		state = "终点换端中"
+		state = locale.T("终点换端中", "Changing ends at the terminus")
 	case v.Dwelling:
-		state = fmt.Sprintf("停靠 %s · %.0f 秒后发车", stop, math.Ceil(v.DwellLeft))
+		state = fmt.Sprintf(locale.T("停靠 %s · %s", "At %s · %s"), stop, g.doorState(v))
+		if g.sim.AtTurnBack(v) {
+			state += locale.T(" · 终点，停站时换端", " · terminus, changing ends during the stop")
+		}
+	}
+	cap := g.sim.Capacity(v)
+	state += fmt.Sprintf(locale.T("   载客 %d/%d", "   load %d/%d"), v.Load(), cap)
+	if v.Load() > cap {
+		state += locale.T("（只下不上）", " (alighting only)")
 	}
 	i := g.lineIndex(v.Line)
 	nth, of := 0, 0
@@ -618,15 +793,33 @@ func (g *Game) drawFollowPanel(dst *ebiten.Image, bottom float32) {
 			}
 		}
 	}
-	title := fmt.Sprintf("正在跟踪  %d 路 · 第 %d/%d 辆 · %d 节编组", i+1, nth, of, v.Cars)
-	w1, _ := textui.MeasureText(title, 16)
+	title := fmt.Sprintf(locale.T("正在跟踪  %d 路 · %s · 第 %d/%d 辆 · %d 节", "Following  line %d · %s · tram %d of %d · %d sections"),
+		i+1, model.Name(), nth, of, v.Cars)
+	w1, _ := textui.MeasureText(title, 15)
 	w2, _ := textui.MeasureText(state, 14)
-	w := float32(math.Max(w1, w2)) + 40
+	const zoomBoxW = 128.0
+	w := float32(math.Max(w1+zoomBoxW, w2)) + 36
 	y := bottom - 64
 	vector.FillRect(dst, 8, y, w, 56, colHUD, false)
 	vector.FillRect(dst, 8, y, 5, 56, lineColors[i%len(lineColors)], false)
-	text(dst, title, 22, float64(y)+7, 16, color.White)
+	text(dst, title, 22, float64(y)+7, 15, color.White)
 	text(dst, state, 22, float64(y)+32, 14, rgb(190, 214, 226))
+
+	// Close-up zoom controls on the top right of the follow card.
+	zx := float64(8+w) - zoomBoxW + 6
+	zy := float64(y) + 5
+	zx = buttonAt(dst, &g.hudBtns, zx, zy, 22, "-", btnPlain, func() {
+		g.zoom = math.Max(minZoom, g.zoom/1.35)
+	}) + 5
+	zlbl := fmt.Sprintf("%.1f×", g.zoom)
+	if g.zoom >= 10 {
+		zlbl = fmt.Sprintf("%.0f×", g.zoom)
+	}
+	zw, _ := textui.MeasureText(zlbl, 13)
+	text(dst, zlbl, zx+(44-zw)/2, zy+3, 13, colHeading)
+	buttonAt(dst, &g.hudBtns, zx+48, zy, 22, "+", btnPlain, func() {
+		g.zoom = math.Min(maxFollowZoom, g.zoom*1.35)
+	})
 }
 
 // Run switches to the Run page (used by command-line flags).

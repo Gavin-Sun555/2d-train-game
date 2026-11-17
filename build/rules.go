@@ -41,6 +41,16 @@ var Rules = map[sim.Level]LevelRules{
 		Level: sim.Underground, Buildable: false,
 		allowed: kinds(city.Road, city.Bridge, city.Grass, city.Park, city.Water, city.Building),
 	},
+	// The rare very high viaduct (high-speed rail) and the deep bore
+	// (express metro) pass over or under everything.
+	sim.HighElevated: {
+		Level: sim.HighElevated, Buildable: false,
+		allowed: kinds(city.Road, city.Bridge, city.Grass, city.Park, city.Water),
+	},
+	sim.DeepUnderground: {
+		Level: sim.DeepUnderground, Buildable: false,
+		allowed: kinds(city.Road, city.Bridge, city.Grass, city.Park, city.Water, city.Building),
+	},
 }
 
 // Mode is the kind of service a line runs. Each mode has its home level and

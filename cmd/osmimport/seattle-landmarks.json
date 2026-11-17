@@ -1,0 +1,303 @@
+[
+ {
+  "name": "太空针塔",
+  "osm": "Space Needle",
+  "lat": 47.620506,
+  "lon": -122.349304,
+  "rank": 1
+ },
+ {
+  "name": "国王街车站",
+  "osm": "King Street Station",
+  "lat": 47.59845,
+  "lon": -122.329954,
+  "rank": 1
+ },
+ {
+  "name": "联合车站",
+  "osm": "Union Station",
+  "lat": 47.598607,
+  "lon": -122.32854,
+  "rank": 1
+ },
+ {
+  "name": "派克市场",
+  "osm": "Pike Place Market",
+  "lat": 47.609486,
+  "lon": -122.341673,
+  "rank": 1
+ },
+ {
+  "name": "流明球场",
+  "osm": "Lumen Field",
+  "lat": 47.595339,
+  "lon": -122.331639,
+  "rank": 1
+ },
+ {
+  "name": "气候承诺体育馆",
+  "osm": "Climate Pledge Arena",
+  "lat": 47.622037,
+  "lon": -122.353977,
+  "rank": 1
+ },
+ {
+  "name": "西雅图中心",
+  "osm": "Seattle Center",
+  "lat": 47.622003,
+  "lon": -122.351545,
+  "rank": 1
+ },
+ {
+  "name": "哥伦比亚中心",
+  "osm": "Columbia Center",
+  "lat": 47.604498,
+  "lon": -122.330717,
+  "rank": 1
+ },
+ {
+  "name": "史密斯塔",
+  "osm": "Smith Tower",
+  "lat": 47.602011,
+  "lon": -122.331733,
+  "rank": 1
+ },
+ {
+  "name": "西雅图摩天轮",
+  "osm": "Seattle Great Wheel",
+  "lat": 47.606167,
+  "lon": -122.3425,
+  "rank": 1
+ },
+ {
+  "name": "西雅图水族馆",
+  "osm": "Seattle Aquarium",
+  "lat": 47.607867,
+  "lon": -122.343031,
+  "rank": 2
+ },
+ {
+  "name": "志愿者公园",
+  "osm": "Volunteer Park",
+  "lat": 47.630381,
+  "lon": -122.31561,
+  "rank": 1
+ },
+ {
+  "name": "港景医疗中心",
+  "osm": "Harborview Medical Center",
+  "lat": 47.60431,
+  "lon": -122.323829,
+  "rank": 2
+ },
+ {
+  "name": "华盛顿公园植物园",
+  "osm": "Washington Park Arboretum",
+  "lat": 47.635951,
+  "lon": -122.292191,
+  "rank": 1
+ },
+ {
+  "name": "西雅图大学",
+  "osm": "Seattle University",
+  "lat": 47.60951,
+  "lon": -122.316832,
+  "rank": 2
+ },
+ {
+  "name": "西雅图艺术博物馆",
+  "osm": "Seattle Art Museum",
+  "lat": 47.607701,
+  "lon": -122.338557,
+  "rank": 2
+ },
+ {
+  "name": "贝纳罗亚音乐厅",
+  "osm": "Benaroya Hall",
+  "lat": 47.608117,
+  "lon": -122.337011,
+  "rank": 2
+ },
+ {
+  "name": "西雅图市政厅",
+  "osm": "Seattle City Hall",
+  "lat": 47.603847,
+  "lon": -122.330049,
+  "rank": 2
+ },
+ {
+  "name": "西湖中心",
+  "osm": "Westlake Center",
+  "lat": 47.612062,
+  "lon": -122.337376,
+  "rank": 2
+ },
+ {
+  "name": "卡尔·安德森公园",
+  "osm": "Cal Anderson Park",
+  "lat": 47.617038,
+  "lon": -122.31917,
+  "rank": 2
+ },
+ {
+  "name": "奇胡利玻璃艺术园",
+  "osm": "Chihuly Garden and Glass",
+  "lat": 47.620535,
+  "lon": -122.350182,
+  "rank": 2
+ },
+ {
+  "name": "凯瑞公园",
+  "osm": "Kerry Park",
+  "lat": 47.629364,
+  "lon": -122.359896,
+  "rank": 2
+ },
+ {
+  "name": "湖景公墓",
+  "osm": "Lake View Cemetery",
+  "lat": 47.634141,
+  "lon": -122.315291,
+  "rank": 2
+ },
+ {
+  "name": "太平洋科学中心",
+  "osm": "Pacific Science Center",
+  "lat": 47.619421,
+  "lon": -122.351386,
+  "rank": 2
+ },
+ {
+  "name": "西雅图渡轮码头",
+  "osm": "Colman Dock",
+  "lat": 47.601653,
+  "lon": -122.336756,
+  "rank": 1
+ },
+ {
+  "name": "宇和岛屋",
+  "osm": "Uwajimaya",
+  "lat": 47.596843,
+  "lon": -122.327043,
+  "rank": 2
+ },
+ {
+  "name": "奥林匹克雕塑公园",
+  "osm": "Olympic Sculpture Park",
+  "lat": 47.616261,
+  "lon": -122.35574,
+  "rank": 2
+ },
+ {
+  "name": "高速公路公园",
+  "osm": "Freeway Park",
+  "lat": 47.610023,
+  "lon": -122.330978,
+  "rank": 2
+ },
+ {
+  "name": "丹尼公园",
+  "osm": "Denny Park",
+  "lat": 47.619122,
+  "lon": -122.341053,
+  "rank": 2
+ },
+ {
+  "name": "默特尔·爱德华兹公园",
+  "osm": "Myrtle Edwards Park",
+  "lat": 47.618609,
+  "lon": -122.360207,
+  "rank": 2
+ },
+ {
+  "name": "西雅图亚洲艺术博物馆",
+  "osm": "Seattle Asian Art Museum",
+  "lat": 47.630282,
+  "lon": -122.314176,
+  "rank": 2
+ },
+ {
+  "name": "因特拉肯公园",
+  "osm": "Interlaken Park",
+  "lat": 47.637509,
+  "lon": -122.308412,
+  "rank": 2
+ },
+ {
+  "name": "T-Mobile 棒球场",
+  "osm": "T-Mobile Park",
+  "lat": 47.591364,
+  "lon": -122.332428,
+  "rank": 1
+ },
+ {
+  "name": "先锋广场",
+  "osm": "Pioneer Square",
+  "lat": 47.602143,
+  "lon": -122.333823,
+  "rank": 1
+ },
+ {
+  "name": "麦迪逊公园",
+  "osm": "Madison Park",
+  "lat": 47.635756,
+  "lon": -122.277315,
+  "rank": 2
+ },
+ {
+  "name": "雷斯基公园",
+  "osm": "Leschi Park",
+  "lat": 47.600944,
+  "lon": -122.287805,
+  "rank": 2
+ },
+ {
+  "name": "西雅图中央图书馆",
+  "osm": "The Seattle Public Library - Central Library",
+  "lat": 47.60669,
+  "lon": -122.33265,
+  "rank": 1
+ },
+ {
+  "name": "流行文化博物馆",
+  "osm": "MoPOP: Museum of Pop Culture",
+  "lat": 47.6215,
+  "lon": -122.34824,
+  "rank": 2
+ },
+ {
+  "name": "亚马逊球体",
+  "osm": "Amazon.com The Spheres",
+  "lat": 47.61565,
+  "lon": -122.33943,
+  "rank": 1
+ },
+ {
+  "name": "中国城牌楼",
+  "osm": "Chinatown Gate",
+  "lat": 47.59836,
+  "lon": -122.32737,
+  "rank": 2
+ },
+ {
+  "name": "西雅图会展中心",
+  "osm": "Seattle Convention Center Summit",
+  "lat": 47.61457,
+  "lon": -122.33139,
+  "rank": 2
+ },
+ {
+  "name": "国会山站",
+  "osm": "Capitol Hill",
+  "lat": 47.61917,
+  "lon": -122.32021,
+  "rank": 2
+ },
+ {
+  "name": "西湖站",
+  "osm": "Westlake",
+  "lat": 47.61177,
+  "lon": -122.33619,
+  "rank": 2
+ }
+]

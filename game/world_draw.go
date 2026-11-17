@@ -6,6 +6,7 @@ import (
 
 	"github.com/Gavin-Sun555/2d-train-game/city"
 	"github.com/Gavin-Sun555/2d-train-game/street"
+	"github.com/Gavin-Sun555/2d-train-game/traffic"
 )
 
 // Palette after 2d-bus-game's default daytime theme.
@@ -263,62 +264,25 @@ func dashed(c *canvas, a, b street.Vec, dash, gap, width float64, col color.RGBA
 
 // --- tram infrastructure ----------------------------------------------------
 
+// crossoverMark outlines where a crossover would go (or is) on a road.
+func (g *Game) crossoverMark(c *canvas, p, d street.Vec, rd street.Road, col color.RGBA) {
+	l, r := rd.Sides()
+	w := math.Max(l, r) * 2
+	if rd.Tram != street.NoTram && !rd.Single {
+		w = rd.CentreGap() + 2*street.LaneWidth
+	}
+	// col is opaque; the fill is a translucent wash of it (premultiplied).
+	k := 0.28
+	c.box(p, d, street.CrossoverLength, w, color.RGBA{uint8(float64(col.R) * k), uint8(float64(col.G) * k), uint8(float64(col.B) * k), uint8(255 * k)})
+	n := street.Vec{X: -d.Y, Y: d.X}
+	h, o := street.CrossoverLength/2, w/2-street.LaneWidth/2
+	for _, s := range []float64{-1, 1} {
+		c.seg(add(add(p, scale(d, -h)), scale(n, s*o)), add(add(p, scale(d, h)), scale(n, -s*o)), 0.35, 1.5, col)
+	}
+}
+
 func (g *Game) drawTrack(c *canvas) {
-	n := g.net
-	sleepers := c.px() > 3
-	for i := range n.Links {
-		l := &n.Links[i]
-		if l.Modes&street.Tram == 0 || (l.Kind == street.LaneLink && !l.Track) {
-			continue
-		}
-		if l.Twin >= 0 && l.Twin < l.ID {
-			continue // same rails as its twin
-		}
-		if !c.visibleAround(l.Pts[0], l.Length+5) {
-			continue
-		}
-		// Sleepers only show on track with its own right of way; in
-		// junctions and lanes shared with cars the rails are set in paving.
-		if sleepers && l.Kind == street.LaneLink && l.Modes == street.Tram {
-			for s := 0.5; s < l.Length; s += 0.9 {
-				p, d := l.PointAt(s)
-				c.box(p, d, 0.22, 2.3, colSleeper)
-			}
-		}
-		rail := colRail
-		if l.Kind == street.ConnectorLink {
-			rail = rgb(120, 128, 136) // rails set in the junction paving
-		}
-		for _, side := range []float64{-0.72, 0.72} {
-			c.polyline(offset(l.Pts, side), 0.11, 0.8, rail)
-		}
-	}
-	// Overhead line poles and span wires along track.
-	if c.px() < 1.2 {
-		return
-	}
-	for _, rd := range n.Roads {
-		if rd.Tram == street.NoTram || !g.roadVisible(c, rd.ID) {
-			continue
-		}
-		a, b := n.Ends(rd.ID)
-		d := unit(sub(b, a))
-		right := street.Vec{X: -d.Y, Y: d.X}
-		l := dist(a, b)
-		hw := rd.HalfWidth()
-		r0, r1 := n.Radius(rd.A), l-n.Radius(rd.B)
-		for s := r0 + 6; s < r1-4; s += 32 {
-			p := a.Lerp(b, s/l)
-			if rd.Class.Median() > 0 && !rd.Single {
-				c.circle(p, 0.3, rgb(60, 66, 72))
-				c.seg(add(p, scale(right, -hw+0.5)), add(p, scale(right, hw-0.5)), 0.06, 0.6, rgba(20, 24, 28, 140))
-				continue
-			}
-			c.seg(add(p, scale(right, -hw-0.6)), add(p, scale(right, hw+0.6)), 0.06, 0.6, rgba(20, 24, 28, 140))
-			c.circle(add(p, scale(right, -hw-0.6)), 0.3, rgb(60, 66, 72))
-			c.circle(add(p, scale(right, hw+0.6)), 0.3, rgb(60, 66, 72))
-		}
-	}
+	g.drawTrackAtLevel(c, 0)
 }
 
 func (g *Game) drawStreetTrees(c *canvas) {
@@ -327,7 +291,7 @@ func (g *Game) drawStreetTrees(c *canvas) {
 	}
 	n := g.net
 	for _, rd := range n.Roads {
-		if !g.roadVisible(c, rd.ID) {
+		if rd.Tramway || !g.roadVisible(c, rd.ID) {
 			continue
 		}
 		a, b := n.Ends(rd.ID)
@@ -347,40 +311,74 @@ func (g *Game) drawStreetTrees(c *canvas) {
 	}
 }
 
-// drawStops draws platforms with shelters.
+// drawStops draws ground platforms with shelters.
 func (g *Game) drawStops(c *canvas) {
+	g.drawStopsAtLevel(c, 0)
+}
+
+// platformLine is the centre line of a platform's island and how far it
+// lies to the right of its track (negative: to the left), as drawn.
+func (g *Game) platformLine(p street.Platform) ([]street.Vec, float64, bool) {
 	n := g.net
-	for _, id := range n.StopIDs() {
-		st := n.Stops[id]
-		if !c.visibleAround(n.StopPos(st), 60) {
+	l := &n.Links[p.Link]
+	if l.Twin >= 0 && l.Twin < l.ID {
+		// Both directions of a track share one drawn platform: the
+		// lower-numbered link's.
+		tw := &n.Links[l.Twin]
+		p.Pos, p.Link, l = tw.Length-(p.Pos-p.Len), l.Twin, tw
+	}
+	st := n.Stops[p.Stop]
+	if st == nil {
+		return nil, 0, false
+	}
+	rd := n.Roads[st.Road]
+	pts := l.Slice(p.Pos-p.Len-1, p.Pos+1)
+	if len(pts) < 2 {
+		return nil, 0, false
+	}
+	side := street.LaneWidth/2 + 0.9
+	if rd.Single {
+		side = 1.35 + 0.9
+	}
+	switch {
+	case rd.OneWay() && !rd.Single:
+		// On a one-way road the track takes the leftmost lane (seen in the
+		// road's direction, A to B), along the kerb: the platform is on the
+		// pavement there, not out in the road. The link drawn may run
+		// either way.
+		ra, rb := n.Ends(rd.ID)
+		if d, e := sub(pts[len(pts)-1], pts[0]), sub(rb, ra); d.X*e.X+d.Y*e.Y > 0 {
+			side = -side
+		}
+	case rd.Class.Median() > 0 && !rd.Single:
+		side = -side
+	}
+	return offset(pts, side), side, true
+}
+
+// doorSide is the side of a stopped tram its platform is on, seen in its
+// direction of travel: 1 right, -1 left (0 if it is at no platform).
+func (g *Game) doorSide(v *traffic.Vehicle, head, dir street.Vec) float64 {
+	st := g.net.Stops[g.sim.TramStop(v)]
+	if st == nil {
+		return 0
+	}
+	id, _ := v.Link()
+	tw := g.net.Links[id].Twin
+	for _, p := range g.net.Platforms(st) {
+		if p.Link != id && p.Link != tw {
 			continue
 		}
-		rd := n.Roads[st.Road]
-		for _, p := range n.Platforms(st) {
-			l := &n.Links[p.Link]
-			if l.Twin >= 0 && l.Twin < l.ID {
-				continue
-			}
-			pts := l.Slice(p.Pos-street.TramLength-2, p.Pos+2)
-			if len(pts) < 2 {
-				continue
-			}
-			side := street.LaneWidth/2 + 0.9
-			if rd.Single {
-				side = 1.35 + 0.9
-			}
-			if rd.Class.Median() > 0 && !rd.Single {
-				side = -side
-			}
-			isl := offset(pts, side)
-			edge := offset(pts, side-math.Copysign(0.75, side))
-			c.polyline(isl, 1.8, 2, rgb(196, 198, 190))
-			c.polyline(edge, 0.3, 0.8, colYellow)
-			mid := isl[0].Lerp(isl[len(isl)-1], 0.5)
-			dir := unit(sub(isl[len(isl)-1], isl[0]))
-			c.box(add(mid, street.Vec{X: 0.4, Y: 0.5}), dir, 8, 1.4, colShadow)
-			c.box(mid, dir, 8, 1.4, rgb(46, 66, 80))
-			c.box(mid, dir, 7.4, 0.9, rgb(98, 140, 160))
+		isl, _, ok := g.platformLine(p)
+		if !ok {
+			return 0
 		}
+		mid := isl[0].Lerp(isl[len(isl)-1], 0.5)
+		right := street.Vec{X: -dir.Y, Y: dir.X}
+		if off := sub(mid, head); off.X*right.X+off.Y*right.Y >= 0 {
+			return 1
+		}
+		return -1
 	}
+	return 0
 }

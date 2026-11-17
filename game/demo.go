@@ -44,12 +44,13 @@ func (g *Game) LoadDemo() error {
 	for _, roads := range lines {
 		var stops []street.StopID
 		for _, r := range []street.RoadID{roads[0], roads[len(roads)/2], roads[len(roads)-1]} {
-			id, err := n.AddStop(r, 0.5)
+			id, err := n.AddStop(r, 0.5, street.DefaultPlatform)
 			if err != nil {
 				return err
 			}
 			stops = append(stops, id)
 		}
+		n.AddEndCrossovers(stops) // turn back over a crossover at each end
 		if _, err := n.AddLine(stops); err != nil {
 			return err
 		}

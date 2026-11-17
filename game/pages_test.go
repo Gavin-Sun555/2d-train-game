@@ -3,6 +3,8 @@ package game
 import (
 	"testing"
 
+	"github.com/hajimehoshi/ebiten/v2"
+
 	"github.com/Gavin-Sun555/2d-train-game/street"
 )
 
@@ -58,5 +60,34 @@ func TestFollowTracksATram(t *testing.T) {
 	g.setPage(pageBuild)
 	if g.follow != 0 {
 		t.Error("leaving Run should stop following")
+	}
+}
+
+func TestFollowZoomAndHighDefTramModelsRender(t *testing.T) {
+	g := New("grid")
+	if err := g.LoadDemo(); err != nil {
+		t.Fatal(err)
+	}
+	if g.maxZoom() != maxMapZoom {
+		t.Fatalf("normal max zoom %.1f, want %.1f", g.maxZoom(), maxMapZoom)
+	}
+	g.Run()
+	g.Warp(90)
+	g.FollowFirst()
+	if g.follow == 0 {
+		t.Fatal("expected to follow a tram")
+	}
+	if g.maxZoom() <= maxMapZoom || g.maxZoom() != maxFollowZoom {
+		t.Fatalf("follow max zoom %.1f, want %.1f (> %.1f)", g.maxZoom(), maxFollowZoom, maxMapZoom)
+	}
+
+	dst := ebiten.NewImage(640, 360)
+	g.Layout(640, 360)
+	id := g.net.LineIDs()[0]
+	for _, m := range street.TramModels {
+		g.net.Lines[id].Model = m.Key
+		g.zoom = maxFollowZoom
+		g.updateFollow()
+		g.Draw(dst)
 	}
 }

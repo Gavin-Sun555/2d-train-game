@@ -13,6 +13,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"io"
+	"math"
 )
 
 type Pt [2]float64
@@ -28,6 +29,9 @@ type Road struct {
 	Back   int    `json:"b"` // lanes against it (0 = one-way)
 	Nodes  []int  `json:"p"` // indices into Map.Nodes
 	Bridge bool   `json:"br,omitempty"`
+	// Layer is the vertical level, -2 (deep tunnel) to 2 (very high
+	// viaduct); 0 is the ground.
+	Layer int `json:"l,omitempty"`
 }
 
 type Building struct {
@@ -59,14 +63,59 @@ type Map struct {
 	Trees       []Pt       `json:"trees"`
 	Tram        [][]Pt     `json:"tram"`
 	TramStops   []Stop     `json:"tramStops"`
+	// Highways are motorways, expressways and their ramps: drawn, but not
+	// part of the street network.
+	Highways  []Road     `json:"highways,omitempty"`
+	Landmarks []Landmark `json:"landmarks,omitempty"`
+}
+
+// Landmark is a well-known place labelled on the map.
+type Landmark struct {
+	Name string `json:"n"`           // shown name
+	OSM  string `json:"o,omitempty"` // name in OpenStreetMap
+	P    Pt     `json:"p"`
+	Rank int    `json:"r,omitempty"` // 1: major (shown from afar), 2: minor
 }
 
 //go:embed seattle.json.gz
 var seattleGz []byte
 
-// Seattle is Downtown Seattle and South Lake Union.
-func Seattle() *Map {
-	m, err := Decode(seattleGz)
+//go:embed seattle-v1.json.gz
+var seattleV1Gz []byte
+
+//go:embed seattle-v2.json.gz
+var seattleV2Gz []byte
+
+//go:embed seattle-v3.json.gz
+var seattleV3Gz []byte
+
+// Seattle is central Seattle from Elliott Bay to Lake Washington: Downtown,
+// Belltown, South Lake Union, Queen Anne, Eastlake, Capitol Hill, First
+// Hill, Pioneer Square, the International District, the Central District,
+// Madison Park and Leschi (bbox 47.592,-122.370,47.645,-122.272), with
+// motorways and landmarks.
+func Seattle() *Map { return mustDecode(seattleGz) }
+
+// SeattleV1 is the first, smaller Seattle map (Downtown and South Lake
+// Union, bbox 47.6045,-122.347,47.6295,-122.329), kept to bring saves made
+// on it over to the current map.
+func SeattleV1() *Map { return mustDecode(seattleV1Gz) }
+
+// SeattleV2 is the second Seattle map (bbox 47.592,-122.370,47.645,-122.312,
+// before it reached Lake Washington and had motorways), kept to bring saves
+// made on it over. It shares the current map's origin and projection.
+func SeattleV2() *Map { return mustDecode(seattleV2Gz) }
+
+// SeattleV3 is the third Seattle map (to Lake Washington, before road
+// levels and ramp junctions), kept to bring saves made on it over.
+func SeattleV3() *Map { return mustDecode(seattleV3Gz) }
+
+// SeattleV1Offset is where SeattleV1's origin lies on the current map, in
+// metres: the difference of the two north-west corners.
+var SeattleV1Offset = Pt{(0.023) * 111320 * math.Cos((47.592+47.645)/2*math.Pi/180), (47.645 - 47.6295) * 110574}
+
+func mustDecode(gz []byte) *Map {
+	m, err := Decode(gz)
 	if err != nil {
 		panic(err)
 	}

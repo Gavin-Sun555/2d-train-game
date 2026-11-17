@@ -5,7 +5,9 @@
 package street
 
 import (
+	"errors"
 	"fmt"
+	"github.com/Gavin-Sun555/2d-train-game/internal/locale"
 	"math"
 	"sort"
 
@@ -57,8 +59,9 @@ type StopID int
 type LineID int
 
 type Junction struct {
-	ID  JunctionID
-	Pos Vec
+	ID    JunctionID
+	Pos   Vec
+	Level int // vertical level: -1 underground, 0 ground, 1 elevated
 }
 
 type Road struct {
@@ -74,10 +77,26 @@ type Road struct {
 	// directions (always its own right of way). Otherwise a road with Tram
 	// set has double track in the innermost lanes.
 	Single bool
+	// Tramway marks a standalone tram-only corridor (off-road ground track,
+	// elevated viaduct, underground tunnel, or transition ramp/portal) with
+	// no car carriageway.
+	Tramway bool
+	// Crossovers are scissors crossovers between the two tracks, as
+	// positions along the road from A (0..1).
+	Crossovers []float64
+	// Level is the road's height in the city's five levels: 0 the ground,
+	// 1 a bridge or viaduct, 2 a very high one; -1 and -2 tunnels.
+	Level int
 }
 
 // Lanes is the number of lanes in one direction (fwd = A→B).
 func (r Road) Lanes(fwd bool) int {
+	if r.Tramway {
+		if r.Single {
+			return 0
+		}
+		return 1
+	}
 	if r.Fwd == 0 && r.Back == 0 {
 		return r.Class.LanesPerDir()
 	}
@@ -87,7 +106,7 @@ func (r Road) Lanes(fwd bool) int {
 	return r.Back
 }
 
-func (r Road) OneWay() bool { return r.Lanes(false) == 0 }
+func (r Road) OneWay() bool { return !r.Tramway && r.Lanes(false) == 0 }
 
 // CentreGap is the width between the two innermost lanes: the median, or
 // the reserved strip of a single centre track.
@@ -133,6 +152,8 @@ type Stop struct {
 	Road RoadID
 	T    float64 // position along the road from A, 0..1
 	Name string
+	// Sections is how many tram sections the platforms hold (0 = default).
+	Sections int
 }
 
 // Line is a tram service calling at stops in order, then back again.
@@ -142,8 +163,26 @@ type Line struct {
 	// Trams is the number of trams running on the line and Sections the
 	// modules in each tram set; zero means the default (see Fleet, Cars).
 	Trams, Sections int
+	// PerSection is the most passengers one section carries (0: default,
+	// see SectionLoad).
+	PerSection int
+	// Boarding and alighting at stops, as in the bus game: seconds per
+	// passenger (tenths; 0: default) and passengers one section serves at
+	// once (its doors; 0: default). Sections work in parallel.
+	BoardTenths, AlightTenths, Doors int
+	// Least time a tram stands at a stop, in seconds (0: default): at
+	// stops on the way, and where it turns back (the driver changes ends).
+	DwellSecs, EndDwellSecs int
+	// Model is the key in TramModels (empty = DefaultTramModel); MaxSpeed is
+	// the line's operating top speed in km/h (0 = the model's supported max).
+	Model    string
+	MaxSpeed int
 
 	pattern []StopID // calling pattern for the current track (see Calls)
+
+	// LineCapacity cache, valid for one network version and stop count.
+	capVer, capStops, capVal int
+	capWhy                   string
 }
 
 // Network is the editable street plan plus its derived lane graph.
@@ -158,10 +197,24 @@ type Network struct {
 	Links   []Link
 	signals map[JunctionID]*Signal
 	heads   []SignalHead
-	roadsAt [][]RoadID
-	lanes   map[laneKey][]LinkID // pieces of each lane, in travel order
-	Blocks  []Block
-	radius  []float64
+	// tramHeads are the tram-only signals.
+	tramHeads []TramSignalHead
+	roadsAt   [][]RoadID
+	lanes     map[laneKey][]LinkID // pieces of each lane, in travel order
+	Blocks    []Block
+	radius    []float64
+	version   int // bumped by every Rebuild
+
+	// Gates are where motorway ramps meet the streets: map node index →
+	// the junction there (real-world maps only).
+	Gates map[int]JunctionID
+	// anchors are the positions of those junctions while the network is
+	// built: a street ending at a ramp is not a dead end.
+	anchors map[Vec]bool
+	edits   []RoadEdit // road edits made on the map's network, in order
+	// CheckCorridor validates terrain, water, buildings and motorways when
+	// building off-road, elevated or underground tramways interactively.
+	CheckCorridor func(a, b Vec, lvA, lvB int) error
 }
 
 // Generate lays the road network over a city map: one road per street
@@ -226,6 +279,11 @@ func (n *Network) pruneDeadEnds() {
 			deg[r.A]++
 			deg[r.B]++
 		}
+		for _, j := range n.Junctions {
+			if n.anchors[j.Pos] {
+				deg[j.ID]++ // it carries on along the ramp
+			}
+		}
 		kept := n.Roads[:0]
 		for _, r := range n.Roads {
 			if deg[r.A] > 1 && deg[r.B] > 1 {
@@ -275,11 +333,19 @@ func (n *Network) Length(r RoadID) float64 {
 	return dist(a, b)
 }
 
-// NearestRoad returns the road whose centre line is closest to q (within
-// maxDist) and the position along it.
+// NearestRoad returns the ground-level road or tramway whose centre line is
+// closest to q (within maxDist) and the position along it.
 func (n *Network) NearestRoad(q Vec, maxDist float64) (RoadID, float64, bool) {
+	return n.NearestRoadAt(q, 0, maxDist)
+}
+
+// NearestStreet returns the car street (!Tramway) closest to q within maxDist.
+func (n *Network) NearestStreet(q Vec, maxDist float64) (RoadID, float64, bool) {
 	best, bestT, bestD := RoadID(-1), 0.0, maxDist
 	for _, r := range n.Roads {
+		if r.Tramway {
+			continue
+		}
 		a, b := n.Ends(r.ID)
 		if t, d := project(q, a, b); d <= bestD {
 			best, bestT, bestD = r.ID, t, d
@@ -288,10 +354,39 @@ func (n *Network) NearestRoad(q Vec, maxDist float64) (RoadID, float64, bool) {
 	return best, bestT, best >= 0
 }
 
-// NearestJunction returns the junction closest to q within maxDist.
+// NearestRoadAt returns the road or tramway touching level whose centre line
+// is closest to q within maxDist.
+func (n *Network) NearestRoadAt(q Vec, level int, maxDist float64) (RoadID, float64, bool) {
+	best, bestT, bestD := RoadID(-1), 0.0, maxDist
+	for _, r := range n.Roads {
+		la, lb := n.RoadLevels(r.ID)
+		if la != level && lb != level {
+			if level == 0 && !r.Tramway {
+				// Ground-network bridges/tunnels still belong to the street view.
+			} else {
+				continue
+			}
+		}
+		a, b := n.Ends(r.ID)
+		if t, d := project(q, a, b); d <= bestD {
+			best, bestT, bestD = r.ID, t, d
+		}
+	}
+	return best, bestT, best >= 0
+}
+
+// NearestJunction returns the ground junction (Level == 0) closest to q within maxDist.
 func (n *Network) NearestJunction(q Vec, maxDist float64) (JunctionID, bool) {
+	return n.NearestJunctionAt(q, 0, maxDist)
+}
+
+// NearestJunctionAt returns the junction at the given level closest to q within maxDist.
+func (n *Network) NearestJunctionAt(q Vec, level int, maxDist float64) (JunctionID, bool) {
 	best, bestD := JunctionID(-1), maxDist
 	for _, j := range n.Junctions {
+		if j.Level != level {
+			continue
+		}
 		if d := dist(j.Pos, q); d <= bestD {
 			best, bestD = j.ID, d
 		}
@@ -299,9 +394,14 @@ func (n *Network) NearestJunction(q Vec, maxDist float64) (JunctionID, bool) {
 	return best, best >= 0
 }
 
-// RoadPath returns the shortest chain of roads between two junctions.
+// RoadPath returns the shortest chain of car streets between two ground junctions.
 func (n *Network) RoadPath(from, to JunctionID) ([]RoadID, bool) {
-	return n.RoadPathCost(from, to, func(r RoadID) float64 { return n.Length(r) })
+	return n.RoadPathCost(from, to, func(r RoadID) float64 {
+		if n.Roads[r].Tramway {
+			return -1
+		}
+		return n.Length(r)
+	})
 }
 
 // RoadPathCost is RoadPath with a custom cost per road (negative = closed).
@@ -365,7 +465,6 @@ func (n *Network) other(r RoadID, j JunctionID) JunctionID {
 // (always dedicated). Removing track also removes the stops on those roads
 // and any line left with < 2 stops.
 func (n *Network) SetTram(roads []RoadID, mode TramMode, single bool) {
-	defer n.fixTermini()
 	for _, r := range roads {
 		// A one-way road carries one track, with the traffic.
 		single := single && !n.Roads[r].OneWay()
@@ -373,6 +472,9 @@ func (n *Network) SetTram(roads []RoadID, mode TramMode, single bool) {
 			mode = Dedicated
 		}
 		n.Roads[r].Tram, n.Roads[r].Single = mode, single && mode != NoTram
+		if mode == NoTram || n.Roads[r].Single || n.Roads[r].OneWay() {
+			n.Roads[r].Crossovers = nil
+		}
 		if mode == NoTram {
 			for _, id := range n.StopIDs() {
 				if n.Stops[id].Road == r {
@@ -384,9 +486,73 @@ func (n *Network) SetTram(roads []RoadID, mode TramMode, single bool) {
 	n.Rebuild()
 }
 
-// MinPlatformClearance keeps a stop far enough from the stop lines for a
-// whole tram to stand at the platform without blocking a junction.
-const MinPlatformClearance = TramLength/2 + 1
+// AddCrossover builds a scissors crossover on a double-track road at t
+// (0..1 from A).
+func (n *Network) AddCrossover(r RoadID, t float64) error {
+	rd := n.Roads[r]
+	if rd.Tram == NoTram || rd.Single || rd.OneWay() {
+		return errors.New(locale.T("渡线只能建在双向的双线轨道上", "Crossovers need two-way double track"))
+	}
+	if n.IsRamp(r) {
+		return errors.New(locale.T("出入坡道上不能建渡线，请在平坦双线段建渡线", "Crossovers can't be built on a sloped portal ramp"))
+	}
+	l := n.Length(r)
+	x := t * l
+	if x-CrossoverLength/2 < n.radius[rd.A]+2 || l-x-CrossoverLength/2 < n.radius[rd.B]+2 {
+		return errors.New(locale.T("离路口太近", "Too close to a junction"))
+	}
+	for _, o := range n.crossoverPos(rd) {
+		if math.Abs(o-x) < CrossoverLength+4 {
+			return errors.New(locale.T("离另一组渡线太近", "Too close to another crossover"))
+		}
+	}
+	for _, s := range n.Stops {
+		if s.Road == r && math.Abs(s.T*l-x) < PlatformLength(s.Capacity())/2+CrossoverLength/2+1 {
+			return fmt.Errorf(locale.T("与 %s 站台重叠", "Overlaps the %s platform"), s.Name)
+		}
+	}
+	n.Roads[r].Crossovers = append(append([]float64(nil), rd.Crossovers...), t)
+	n.Rebuild()
+	return nil
+}
+
+// RemoveCrossover removes the crossover on road r nearest t, if one is
+// within maxDist metres.
+func (n *Network) RemoveCrossover(r RoadID, t, maxDist float64) bool {
+	rd := &n.Roads[r]
+	l := n.Length(r)
+	for i, c := range rd.Crossovers {
+		if math.Abs(c-t)*l <= maxDist {
+			rd.Crossovers = append(append([]float64(nil), rd.Crossovers[:i]...), rd.Crossovers[i+1:]...)
+			n.Rebuild()
+			return true
+		}
+	}
+	return false
+}
+
+// CrossoverAt returns the ground crossover nearest to q within maxDist.
+func (n *Network) CrossoverAt(q Vec, maxDist float64) (RoadID, float64, bool) {
+	return n.CrossoverAtLevel(q, 0, maxDist)
+}
+
+// CrossoverAtLevel returns the crossover on a road touching level nearest to q.
+func (n *Network) CrossoverAtLevel(q Vec, level int, maxDist float64) (RoadID, float64, bool) {
+	best, bt, bd := RoadID(-1), 0.0, maxDist
+	for _, rd := range n.Roads {
+		la, lb := n.RoadLevels(rd.ID)
+		if la != level && lb != level {
+			continue
+		}
+		a, b := n.Ends(rd.ID)
+		for _, t := range rd.Crossovers {
+			if d := dist(a.Lerp(b, t), q); d <= bd {
+				best, bt, bd = rd.ID, t, d
+			}
+		}
+	}
+	return best, bt, best >= 0
+}
 
 var stopNames = []string{
 	"Central", "Market St", "City Hall", "Riverside", "Park Gate", "Museum",
@@ -395,33 +561,73 @@ var stopNames = []string{
 	"North End", "South Quay", "Theatre", "Arcade", "Elm Row", "Foundry",
 }
 
-// AddStop places a stop on a road that has tram track.
-func (n *Network) AddStop(r RoadID, t float64) (StopID, error) {
-	rd := n.Roads[r]
-	if rd.Tram == NoTram {
-		return 0, fmt.Errorf("stops need tram track on the road")
+// AddStop places a stop with platforms for the given number of tram
+// sections on a road that has tram track.
+func (n *Network) AddStop(r RoadID, t float64, sections int) (StopID, error) {
+	if n.Roads[r].Tram == NoTram {
+		return 0, errors.New(locale.T("道路上没有电车轨道", "The road has no tram track"))
 	}
-	l := n.Length(r)
-	d := t * l
-	if d < MinPlatformClearance+n.radius[rd.A] || l-d < MinPlatformClearance+n.radius[rd.B] {
-		return 0, fmt.Errorf("too close to a junction")
-	}
-	for _, s := range n.Stops {
-		if s.Road == r && math.Abs(s.T-t)*l < 50 {
-			return 0, fmt.Errorf("too close to %s", s.Name)
-		}
+	if n.IsRamp(r) {
+		return 0, errors.New(locale.T("出入坡道上不能设站，请在平坦路段设站", "Stops can't be built on a sloped portal ramp"))
 	}
 	id := StopID(n.id())
 	name := stopNames[len(n.Stops)%len(stopNames)]
 	if k := len(n.Stops) / len(stopNames); k > 0 {
 		name = fmt.Sprintf("%s %d", name, k+1)
 	}
-	n.Stops[id] = &Stop{ID: id, Road: r, T: t, Name: name}
-	if len(n.Platforms(n.Stops[id])) == 0 {
-		delete(n.Stops, id)
-		return 0, fmt.Errorf("no room for a platform here (terminus turnback track)")
+	st := &Stop{ID: id, Road: r, T: t, Name: name, Sections: clampSections(sections)}
+	if err := n.placeStop(st, nil); err != nil {
+		return 0, err
 	}
 	return id, nil
+}
+
+// SetStopSections rebuilds a stop's platforms for a different tram length.
+func (n *Network) SetStopSections(id StopID, sections int) error {
+	st := n.Stops[id]
+	if st == nil {
+		return errors.New(locale.T("车站不存在", "No such stop"))
+	}
+	old := *st
+	next := old
+	next.Sections = clampSections(sections)
+	return n.placeStop(&next, &old)
+}
+
+// placeStop puts st on the network (replacing old, if given) when its
+// platforms fit: clear of junctions and other stops, and leaving room for
+// any terminus crossover on the road.
+func (n *Network) placeStop(st, old *Stop) error {
+	rd := n.Roads[st.Road]
+	l := n.Length(st.Road)
+	d := st.T * l
+	half := PlatformLength(st.Capacity())/2 + 1
+	if d < half+n.radius[rd.A] || l-d < half+n.radius[rd.B] {
+		return fmt.Errorf(locale.T("离路口太近，放不下 %d 节站台", "Too close to a junction for a %d-section platform"), st.Capacity())
+	}
+	for _, o := range n.Stops {
+		if o.ID != st.ID && o.Road == st.Road &&
+			math.Abs(o.T-st.T)*l < (PlatformLength(o.Capacity())+PlatformLength(st.Capacity()))/2+14 {
+			return fmt.Errorf(locale.T("离 %s 站太近", "Too close to %s"), o.Name)
+		}
+	}
+	for _, x := range n.crossoverPos(rd) {
+		if math.Abs(x-d) < PlatformLength(st.Capacity())/2+CrossoverLength/2+1 {
+			return errors.New(locale.T("站台与渡线重叠", "The platform overlaps a crossover"))
+		}
+	}
+	n.Stops[st.ID] = st
+	n.Rebuild()
+	if len(n.Platforms(st)) == 0 {
+		if old != nil {
+			n.Stops[st.ID] = old
+		} else {
+			delete(n.Stops, st.ID)
+		}
+		n.Rebuild()
+		return errors.New(locale.T("这里放不下站台", "A platform doesn't fit here"))
+	}
+	return nil
 }
 
 func (n *Network) deleteStop(id StopID) {
@@ -465,13 +671,29 @@ func (n *Network) StopPos(s *Stop) Vec {
 	return a.Lerp(b, s.T)
 }
 
-// StopNear returns the stop closest to q within maxDist.
+// StopNear returns the stop closest to q within maxDist across all levels.
 func (n *Network) StopNear(q Vec, maxDist float64) (*Stop, bool) {
 	var best *Stop
 	bestD := maxDist
 	for _, id := range n.StopIDs() {
 		if d := dist(n.StopPos(n.Stops[id]), q); d <= bestD {
 			best, bestD = n.Stops[id], d
+		}
+	}
+	return best, best != nil
+}
+
+// StopNearAt returns the stop on the given level closest to q within maxDist.
+func (n *Network) StopNearAt(q Vec, level int, maxDist float64) (*Stop, bool) {
+	var best *Stop
+	bestD := maxDist
+	for _, id := range n.StopIDs() {
+		st := n.Stops[id]
+		if n.StopLevel(st) != level {
+			continue
+		}
+		if d := dist(n.StopPos(st), q); d <= bestD {
+			best, bestD = st, d
 		}
 	}
 	return best, best != nil
@@ -527,4 +749,68 @@ func (n *Network) BoxHalf(j JunctionID) float64 {
 		return 0
 	}
 	return n.radius[j] - JunctionApproach
+}
+
+// AddEndCrossovers builds a crossover near each end stop of a line through
+// stops, so trams can turn back there: on the stop's road towards the rest
+// of the line if it fits, else beyond the stop, else on a neighbouring
+// road. It reports how many it built.
+func (n *Network) AddEndCrossovers(stops []StopID) int {
+	built := 0
+	if len(stops) < 2 {
+		return 0
+	}
+	for _, pair := range [][2]StopID{{stops[0], stops[1]}, {stops[len(stops)-1], stops[len(stops)-2]}} {
+		st, nb := n.Stops[pair[0]], n.Stops[pair[1]]
+		if st == nil || nb == nil {
+			continue
+		}
+		a, b := n.Ends(st.Road)
+		towardA := dist(a, n.StopPos(nb)) < dist(b, n.StopPos(nb))
+		if nb.Road == st.Road {
+			towardA = nb.T < st.T
+		}
+		l := n.Length(st.Road)
+		gap := (PlatformLength(st.Capacity())/2 + CrossoverLength/2 + 3) / l
+		step := 3 / l
+		var tries []float64
+		for _, side := range []float64{1, -1} {
+			dir := side
+			if towardA {
+				dir = -side
+			}
+			for t := st.T + dir*gap; t > 0 && t < 1; t += dir * step {
+				tries = append(tries, t)
+			}
+		}
+		ok := false
+		for _, t := range tries {
+			if n.AddCrossover(st.Road, t) == nil {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			// A neighbouring road with track, at the end towards the line.
+			j := n.Roads[st.Road].B
+			if towardA {
+				j = n.Roads[st.Road].A
+			}
+			for _, r := range n.roadsAt[j] {
+				if r == st.Road || n.Roads[r].Tram == NoTram {
+					continue
+				}
+				for k := 1; k < 20 && !ok; k++ {
+					ok = n.AddCrossover(r, float64(k)/20) == nil
+				}
+				if ok {
+					break
+				}
+			}
+		}
+		if ok {
+			built++
+		}
+	}
+	return built
 }

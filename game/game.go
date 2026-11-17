@@ -4,8 +4,10 @@ package game
 
 import (
 	"fmt"
+	"github.com/Gavin-Sun555/2d-train-game/internal/locale"
 	"image/color"
 	"math"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -28,37 +30,58 @@ const (
 	pageRun
 )
 
-var pageNames = []string{"建设", "规划", "运行"}
+func pageNames() []string {
+	return locale.L([]string{"建设", "规划", "运行"}, []string{"Build", "Plan", "Run"})
+}
 
 type tool int
 
 const (
 	toolTrack tool = iota
 	toolStop
+	toolCrossover
 	toolRemove
+	toolRoad
 )
 
-var toolNames = []string{"轨道", "车站", "拆除"}
+func toolNames() []string {
+	return locale.L([]string{"轨道", "车站", "渡线", "拆除", "道路"}, []string{"Track", "Stop", "Crossover", "Remove", "Road"})
+}
 
 // layouts are the track options the Track tool cycles through with M.
 var layouts = []struct {
-	name   string
+	zh, en string
 	mode   street.TramMode
 	single bool
 }{
-	{"双线 · 独立路权", street.Dedicated, false},
-	{"双线 · 混行", street.Shared, false},
-	{"单线 · 往返（拉风箱）", street.Dedicated, true},
+	{"双线 · 独立路权", "Double track · own right of way", street.Dedicated, false},
+	{"双线 · 混行", "Double track · shared with cars", street.Shared, false},
+	{"单线 · 往返（拉风箱）", "Single track · back and forth", street.Dedicated, true},
 }
 
-var levelNames = []string{"地面", "高架", "地下"}
+func layoutName(i int) string { return locale.T(layouts[i].zh, layouts[i].en) }
 
-// Grade-separated levels are reserved for metro / light rail.
-var levels = []sim.Level{sim.Ground, sim.Elevated, sim.Underground}
+// levels are the city's five vertical levels, top to bottom (see
+// levels.go). Only the ground can be built on today.
+var levels = []sim.Level{sim.HighElevated, sim.Elevated, sim.Ground, sim.Underground, sim.DeepUnderground}
+
+func levelNames() []string {
+	return locale.L([]string{"超高层", "高架层", "地面层", "地下层", "深地下层"}, []string{"High level", "Elevated", "Ground", "Underground", "Deep level"})
+}
+
+const groundLevel = 2 // index of the ground in levels
 
 var speeds = []int{1, 2, 4, 8, 16}
 
-var densities = []int{0, 200, 400, 600}
+// densities are the numbers of AI cars to choose from.
+var densities = []int{200, 500, 1000, 2000, 3000}
+
+const defaultDensity = 1
+
+// passNames() name traffic.PassengerRates, as in the bus game.
+func passNames() []string {
+	return locale.L([]string{"偏少", "适中", "偏多"}, []string{"Few", "Moderate", "Many"})
+}
 
 var (
 	colAccent  = rgb(84, 186, 204)
@@ -94,23 +117,54 @@ type Game struct {
 	mapH  float64
 	net   *street.Network
 	sim   *traffic.Sim
+	// freshNet builds the map's own street network, before any edits.
+	freshNet func() *street.Network
 
-	page       page
-	tool       tool
-	dirty      bool // edited since the simulation was last (re)started
-	selLine    street.LineID
-	follow     int  // ID of the tram the camera follows (0 = none)
-	toMenu     bool // Esc pressed with nothing to cancel
-	routes     map[street.LineID][][]street.Vec
-	cycles     map[street.LineID]lineCycle
-	legend     []legendItem
-	cfgBtns    []cfgButton
-	cfgPanel   rect
-	layout     int // index into layouts
-	level      int
-	densityIdx int
-	start      street.JunctionID // first junction of a track run, -1 if none
-	pending    []street.StopID   // stops picked for a new line
+	page                page
+	tool                tool
+	dirty               bool // edited since the simulation was last (re)started
+	selLine             street.LineID
+	follow              int  // ID of the tram the camera follows (0 = none)
+	toMenu              bool // Esc pressed with nothing to cancel
+	routes              map[street.LineID][][]street.Vec
+	cycles              map[street.LineID]lineCycle
+	legend              []legendItem
+	cfgBtns             []cfgButton
+	cfgPanel            rect
+	key                 string // map key, names the save file
+	lastSave            []byte // contents last written (or loaded), to skip unchanged saves
+	saveTick            int
+	autoLast            []byte    // contents of the last autosave
+	autoAt              time.Time // when autosaves were last considered
+	slots               *slotPanel
+	noSave              bool // demo / screenshot runs never write saves
+	hudBtns             []hudButton
+	drop                *dropMenu       // open drop-down list on the top bar
+	treeEdits           int             // road edits the trees were last placed for
+	treeNet             *street.Network // and the network
+	sound               soundState
+	soundPanel          bool // the volume panel is open
+	soundBtn, soundRect rect
+	lastAnnouncement    string     // the last announcement made (shown and tested)
+	lines               *linePanel   // line management window, nil when closed
+	modelMenu           *modelPicker // open tram model selector, nil when closed
+	rename              *renameBox   // landmark rename window, nil when closed
+	lmLabels            []landmarkLabel
+	stopLabels          []stopLabel // stop name labels drawn this frame
+	// landmarkNames are the player's names for landmarks, by OSM name.
+	landmarkNames map[string]string
+	shadowImg     *ebiten.Image // building shadow layer (Seattle)
+	layout        int           // index into layouts
+	platform      int           // sections new stops' platforms hold
+	level         int
+	densityIdx    int
+	passIdx       int               // index into traffic.PassengerRates
+	start         street.JunctionID // first junction of a track run, -1 if none
+	anchor        *trackAnchor      // active start point & level for point-to-point track building
+	roadMode      int               // Road tool: build, demolish or lanes
+	roadLanes     int               // index into roadLaneOpts
+	roadStart     *street.Vec       // first point of a new street
+	pending       []street.StopID   // stops picked for a new line
 
 	paused   bool
 	speedIdx int
@@ -129,20 +183,38 @@ type Game struct {
 	msgTTL  int
 }
 
-// New starts a game on a map: "seattle" (real Downtown & South Lake Union
+// New starts a game on a map: "seattle" (central Seattle
 // from OpenStreetMap) or "grid" (the generated test city).
 func New(mapName string) *Game {
-	g := &Game{w: 1280, h: 720, start: -1, densityIdx: 2, selLine: -1}
-	if mapName == "grid" {
-		g.city = city.Generate(1)
-		g.net = street.Generate(g.city)
-		g.mapW, g.mapH = g.city.SizeMetres()
-	} else {
-		m := mapdata.Seattle()
-		g.scene = newScene(m)
-		g.net = street.FromMap(m)
-		g.mapW, g.mapH = m.W, m.H
+	if mapName != "grid" {
+		return newOnMap(mapName, mapdata.Seattle())
 	}
+	g := newGame(mapName)
+	g.city = city.Generate(1)
+	g.freshNet = func() *street.Network { return street.Generate(g.city) }
+	g.net = g.freshNet()
+	g.mapW, g.mapH = g.city.SizeMetres()
+	return g.ready()
+}
+
+// newOnMap starts a game on a real-world map.
+func newOnMap(key string, m *mapdata.Map) *Game {
+	g := newGame(key)
+	g.scene = newScene(m)
+	g.freshNet = func() *street.Network { return street.FromMap(m) }
+	g.net = g.freshNet()
+	g.scene.joinStreets(g.net)
+	g.roadsChanged()
+	g.mapW, g.mapH = m.W, m.H
+	return g.ready()
+}
+
+func newGame(key string) *Game {
+	return &Game{cfgPanel: rect{-1, -1, -1, -1}, w: 1280, h: 720, start: -1, roadLanes: defaultRoadLanes, level: groundLevel, densityIdx: defaultDensity, passIdx: traffic.DefaultPassengerRate, selLine: -1, platform: street.DefaultPlatform, key: key}
+}
+
+func (g *Game) ready() *Game {
+	g.attachCorridorCheck()
 	g.camX, g.camY = g.mapW/2, g.mapH/2
 	g.zoom = 1.0
 	g.rebuild()
@@ -162,12 +234,22 @@ func (g *Game) Warp(seconds float64) {
 // rebuild restarts traffic on the edited network.
 func (g *Game) rebuild() {
 	g.sim = traffic.New(g.net, densities[g.densityIdx], 1)
+	g.sim.PassengerRate = traffic.PassengerRates[g.passIdx]
 	g.dirty, g.routes, g.cycles, g.follow = false, nil, nil, 0
 }
 
 // edited marks the network changed; the service restarts on the Run page.
 func (g *Game) edited() {
 	g.dirty, g.routes, g.cycles = true, nil, nil
+	g.roadsChanged()
+}
+
+// roadsChanged moves the street trees for edited roads.
+func (g *Game) roadsChanged() {
+	if g.scene != nil && (g.treeNet != g.net || len(g.net.Edits()) != g.treeEdits) {
+		g.treeNet, g.treeEdits = g.net, len(g.net.Edits())
+		g.scene.placeTrees(g.net)
+	}
 }
 
 func (g *Game) say(format string, args ...any) {
@@ -193,6 +275,38 @@ func (g *Game) pick(px float64) float64 { return px / g.zoom }
 // --- update -----------------------------------------------------------------
 
 func (g *Game) Update() error {
+	if g.slots != nil {
+		g.updateSlots()
+		return nil
+	}
+	if g.rename != nil {
+		g.updateRename()
+		g.stepSim()
+		return nil
+	}
+	if g.clickHUD() {
+		return nil
+	}
+	switch {
+	case inpututil.IsKeyJustPressed(ebiten.KeyF5):
+		g.openSlots(true)
+		return nil
+	case inpututil.IsKeyJustPressed(ebiten.KeyF9):
+		g.openSlots(false)
+		return nil
+	case inpututil.IsKeyJustPressed(ebiten.KeyT):
+		g.toggleLinePanel()
+		return nil
+	case inpututil.IsKeyJustPressed(ebiten.KeyV):
+		g.soundPanel = !g.soundPanel
+		return nil
+	}
+	if g.lines != nil {
+		g.updateLinePanel()
+		g.stepSim()
+		g.updateFollow()
+		return nil
+	}
 	g.updateCamera()
 	mx, my := ebiten.CursorPosition()
 	g.cursor = g.toWorld(mx, my)
@@ -203,17 +317,26 @@ func (g *Game) Update() error {
 	if g.msgTTL > 0 {
 		g.msgTTL--
 	}
+	g.stepSim()
+	g.updateFollow()
+	g.updateSound()
+	return nil
+}
+
+// stepSim runs the service on the Run page.
+func (g *Game) stepSim() {
 	if g.page == pageRun && !g.paused {
 		for i := 0; i < speeds[g.speedIdx]; i++ {
 			g.sim.Step()
 		}
 	}
-	g.updateFollow()
-	return nil
 }
 
 func (g *Game) updateCamera() {
 	pan := 600 / g.zoom / 60
+	if ebiten.IsKeyPressed(ebiten.KeyMeta) || ebiten.IsKeyPressed(ebiten.KeyControl) {
+		pan = 0 // Cmd/Ctrl shortcuts (Cmd+S saves) do not pan
+	}
 	for _, k := range []ebiten.Key{ebiten.KeyA, ebiten.KeyD, ebiten.KeyW, ebiten.KeyS, ebiten.KeyArrowLeft, ebiten.KeyArrowRight, ebiten.KeyArrowUp, ebiten.KeyArrowDown} {
 		if ebiten.IsKeyPressed(k) {
 			g.follow = 0 // taking the camera back stops following
@@ -233,9 +356,13 @@ func (g *Game) updateCamera() {
 	}
 	mx, my := ebiten.CursorPosition()
 	zoomAt := func(f float64) {
-		before := g.toWorld(mx, my)
-		g.zoom = math.Max(0.25, math.Min(10, g.zoom*f))
-		after := g.toWorld(mx, my)
+		zx, zy := mx, my
+		if g.follow != 0 {
+			zx, zy = g.w/2, g.h/2 // zoom around the followed tram at screen centre
+		}
+		before := g.toWorld(zx, zy)
+		g.zoom = math.Max(minZoom, math.Min(g.maxZoom(), g.zoom*f))
+		after := g.toWorld(zx, zy)
 		g.camX += before.X - after.X
 		g.camY += before.Y - after.Y
 	}
@@ -245,7 +372,15 @@ func (g *Game) updateCamera() {
 		zoomAt(math.Max(0.5, 1+p))
 	}
 	if wy := platforminput.TakeMouseWheelY(); wy != 0 {
-		zoomAt(math.Pow(1.15, wy))
+		if !g.scrollModelMenu(wy) {
+			zoomAt(math.Pow(1.15, wy))
+		}
+	}
+	if g.follow == 0 && g.zoom > maxMapZoom {
+		g.zoom = math.Max(maxMapZoom, g.zoom*0.88)
+		if g.zoom-maxMapZoom < 0.05 {
+			g.zoom = maxMapZoom
+		}
 	}
 
 	// Press and drag (trackpad click or left/middle mouse button) pans the
@@ -279,7 +414,19 @@ func (g *Game) updateCamera() {
 
 // --- draw -------------------------------------------------------------------
 
-const hudHeight = 34
+const (
+	hudHeight     = 34
+	minZoom       = 0.18
+	maxMapZoom    = 10.0
+	maxFollowZoom = 45.0
+)
+
+func (g *Game) maxZoom() float64 {
+	if g.follow != 0 {
+		return maxFollowZoom
+	}
+	return maxMapZoom
+}
 
 // dragThreshold is how far (px) a press must move to pan instead of click.
 const dragThreshold = 5
@@ -289,6 +436,10 @@ func (g *Game) Draw(dst *ebiten.Image) {
 	g.drawLabels(dst)
 	g.drawHUD(dst)
 	g.drawAttribution(dst)
+	g.drawLinePanel(dst)
+	g.drawModelMenu(dst)
+	g.drawRename(dst)
+	g.drawSlots(dst, g.w, g.h)
 }
 
 // drawWorld draws the map, track, stops and (on the Run page) vehicles.
@@ -297,26 +448,48 @@ func (g *Game) drawWorld(dst *ebiten.Image) {
 	if g.scene != nil {
 		dst.Fill(colUrban)
 		g.drawSceneGround(c)
+		g.drawHighways(c, 0)
 		g.drawRealStreets(c)
+		g.drawTunnels(c)
+		g.drawUndergroundOnGround(c)
+		g.drawHighways(c, 1)
+		g.drawHighways(c, 2)
+		g.drawGroundTramways(c)
 		g.drawTrack(c)
-		g.drawStops(c)
+		c.flush()
+		g.drawSceneShadows(dst)
+		g.drawStreetNames(dst) // under the trams and cars
 		g.drawVehicles(c)
+		g.drawPortalHeadwalls(c)
 		g.drawSceneBuildings(c)
+		// Platforms after the buildings: on a one-way street they stand on
+		// the pavement, which mapped buildings often overhang.
+		g.drawStops(c)
 		g.drawSceneTrees(c)
 	} else {
 		dst.Fill(colGround)
 		g.drawGround(c)
 		g.drawLots(c)
+		g.drawUndergroundOnGround(c)
 		g.drawRealStreets(c)
+		g.drawGroundTramways(c)
 		g.drawTrack(c)
 		g.drawStops(c)
 		g.drawStreetTrees(c)
+		c.flush()
+		g.drawStreetNames(dst) // under the trams and cars
 		g.drawVehicles(c)
+		g.drawPortalHeadwalls(c)
 	}
 	g.drawSignals(c)
-	g.drawToolOverlay(c)
+	g.drawTramSignals(c)
+	g.drawElevatedLayer(c)
+	g.drawUndergroundCutaway(c)
+	if levelHeight(g.level) == 0 {
+		g.drawToolOverlay(c)
+	}
 	c.flush()
-	g.drawStreetNames(dst)
+	g.drawLevelView(dst)
 }
 
 func (g *Game) highlightRoads(c *canvas, roads []street.RoadID, col color.RGBA) {

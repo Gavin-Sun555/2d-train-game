@@ -21,7 +21,9 @@ func TestSeattleNetwork(t *testing.T) {
 		t.Error("downtown Seattle should have one-way streets")
 	}
 	for _, l := range n.Links {
-		if l.Kind == LaneLink && l.Modes&Car != 0 && len(l.Next) == 0 && n.Roads[l.Road].OneWay() {
+		// One-way streets onto a motorway ramp carry on along the ramp.
+		if l.Kind == LaneLink && l.Modes&Car != 0 && len(l.Next) == 0 && n.Roads[l.Road].OneWay() &&
+			!n.anchors[n.Junctions[n.Roads[l.Road].B].Pos] {
 			t.Errorf("one-way lane %d on %q leads nowhere", l.ID, n.Roads[l.Road].Name)
 		}
 		if l.Kind == LaneLink && l.Length < 5 {

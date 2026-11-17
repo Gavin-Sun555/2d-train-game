@@ -49,37 +49,33 @@ func (s *Sim) CheckInvariants() error {
 			}
 		}
 	}
-	// Track blocks: never vehicles running both ways, and only one tram at
-	// a time on single track.
-	pos := map[int]map[int]bool{}
-	neg := map[int]map[int]bool{}
+	// Single track: one tram at a time in a block.
+	trams := map[int]map[int]bool{}
 	for _, v := range s.Vehicles {
+		var err error
 		s.covered(v, func(k int, _ float64) {
-			l := &s.Net.Links[v.Path[k]]
-			if l.Block < 0 {
-				return
+			id := v.Path[k]
+			l := &s.Net.Links[id]
+			if l.Block >= 0 {
+				if trams[l.Block] == nil {
+					trams[l.Block] = map[int]bool{}
+				}
+				trams[l.Block][v.ID] = true
 			}
-			m := pos
-			if l.BlockSign < 0 {
-				m = neg
+			// Against the normal direction only on track reserved for it,
+			// and nobody else on reserved track.
+			o := s.owner[unitOf(s.Net, id)]
+			if err == nil && ((l.Contra && o != v.ID) || (o != 0 && o != v.ID)) {
+				err = fmt.Errorf("vehicle %d on link %d reserved by %d", v.ID, id, o)
 			}
-			if m[l.Block] == nil {
-				m[l.Block] = map[int]bool{}
-			}
-			m[l.Block][v.ID] = true
 		})
+		if err != nil {
+			return err
+		}
 	}
-	for b := range s.Net.Blocks {
-		both := map[int]bool{}
-		for id := range pos[b] {
-			both[id] = true
-		}
-		for id := range neg[b] {
-			both[id] = true
-		}
-		mixed := len(pos[b]) > 0 && len(neg[b]) > 0 && len(both) > 1
-		if mixed || (s.Net.Blocks[b].Kind == street.SingleTrackBlock && len(both) > 1) {
-			return fmt.Errorf("track block %d occupied by %d vehicles in conflicting directions", b, len(both))
+	for b, vs := range trams {
+		if len(vs) > 1 {
+			return fmt.Errorf("single-track block %d occupied by %d trams", b, len(vs))
 		}
 	}
 	return nil

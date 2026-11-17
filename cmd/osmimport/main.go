@@ -2,8 +2,8 @@
 // from https://api.openstreetmap.org/api/0.6/map?bbox=...) into the compact
 // map format of package mapdata.
 //
-//	go run ./cmd/osmimport -bbox 47.6045,-122.347,47.6295,-122.329 \
-//	    -name "Seattle Downtown & SLU" -out mapdata/seattle.json.gz tiles/*.osm
+//	go run ./cmd/osmimport -bbox 47.592,-122.370,47.645,-122.312 \
+//	    -name "Seattle" -out mapdata/seattle.json.gz seattle.osm
 //
 // Water test points (-water lat,lon;...) pick which side of each coastline
 // or lake shore is water when closing it along the map edge.
@@ -97,10 +97,11 @@ func round(v float64) float64 { return math.Round(v*10) / 10 }
 func inside(lat, lon float64) bool { return lat >= s0 && lat <= n0 && lon >= w0 && lon <= e0 }
 
 func main() {
-	bbox := flag.String("bbox", "47.6045,-122.347,47.6295,-122.329", "south,west,north,east")
-	name := flag.String("name", "Seattle Downtown & SLU", "map name")
+	bbox := flag.String("bbox", "47.592,-122.370,47.645,-122.312", "south,west,north,east")
+	name := flag.String("name", "Seattle", "map name")
 	out := flag.String("out", "mapdata/seattle.json.gz", "output file")
-	water := flag.String("water", "47.6060,-122.3462;47.6292,-122.3380", "water test points lat,lon;...")
+	water := flag.String("water", "47.6050,-122.3560;47.6350,-122.3340", "water test points lat,lon;...")
+	landmarks := flag.String("landmarks", "", "JSON list of named landmarks to place ([{name, osm, lat, lon, rank}])")
 	flag.Parse()
 	if _, err := fmt.Sscanf(*bbox, "%f,%f,%f,%f", &s0, &w0, &n0, &e0); err != nil {
 		log.Fatalf("-bbox: %v", err)
@@ -141,9 +142,11 @@ func main() {
 	importBuildings(m, ids)
 	importBuildingRelations(m)
 	importAreas(m, ids)
+	importAreaRelations(m)
 	importWater(m, ids, *water)
 	importTrees(m)
 	importTram(m, ids)
+	importLandmarks(m, *landmarks)
 
 	f, err := os.Create(*out)
 	if err != nil {
@@ -155,6 +158,7 @@ func main() {
 	}
 	zw.Close()
 	f.Close()
+	log.Printf("%d highway pieces, %d landmarks", len(m.Highways), len(m.Landmarks))
 	log.Printf("%s: %.0f×%.0f m, %d road nodes, %d roads, %d buildings, %d areas, %d trees, %d tram ways, %d tram stops",
 		*out, m.W, m.H, len(m.Nodes), len(m.Roads), len(m.Buildings), len(m.Areas), len(m.Trees), len(m.Tram), len(m.TramStops))
 }
@@ -179,23 +183,56 @@ func atoi(s string) int {
 	return n
 }
 
-func importRoads(m *mapdata.Map, ids []int64) {
-	index := map[int64]int{}
-	nodeIndex := func(id int64) int {
-		if i, ok := index[id]; ok {
-			return i
-		}
-		n := nodes[id]
-		index[id] = len(m.Nodes)
-		m.Nodes = append(m.Nodes, project(n.lat, n.lon))
-		return index[id]
+var nodeIdx = map[int64]int{}
+
+func nodeIndex(m *mapdata.Map, id int64) int {
+	if i, ok := nodeIdx[id]; ok {
+		return i
 	}
+	n := nodes[id]
+	nodeIdx[id] = len(m.Nodes)
+	m.Nodes = append(m.Nodes, project(n.lat, n.lon))
+	return nodeIdx[id]
+}
+
+// Motorways, expressways and their ramps: drawn on the map, but not part of
+// the street network (no trams, no junctions with the streets they cross).
+var highwayClasses = map[string]bool{
+	"motorway": true, "motorway_link": true, "trunk": true, "trunk_link": true,
+}
+
+func importRoads(m *mapdata.Map, ids []int64) {
+	importWays(m, ids, roadClasses, &m.Roads)
+	importWays(m, ids, highwayClasses, &m.Highways)
+}
+
+func importWays(m *mapdata.Map, ids []int64, classes map[string]bool, into *[]mapdata.Road) {
 	for _, id := range ids {
 		w := ways[id]
 		hw := w.tags["highway"]
-		if !roadClasses[hw] || w.tags["area"] == "yes" || w.tags["tunnel"] == "yes" {
+		tunnel := w.tags["tunnel"] != "" && w.tags["tunnel"] != "no" && w.tags["tunnel"] != "building_passage"
+		// Streets in tunnels are left out; motorway tunnels are kept on
+		// their underground level.
+		if !classes[hw] || w.tags["area"] == "yes" || (tunnel && !classes["motorway"]) {
 			continue
 		}
+		switch w.tags["access"] {
+		case "private", "no", "customers", "delivery", "permissive", "destination":
+			if classes["motorway"] {
+				continue // ferry holding lanes and the like are not motorways
+			}
+		}
+		layer := atoi(w.tags["layer"])
+		bridgeTag := w.tags["bridge"] != "" && w.tags["bridge"] != "no"
+		switch {
+		case tunnel:
+			layer = min(layer, -1)
+		case bridgeTag:
+			layer = max(layer, 1)
+		case layer < 0:
+			layer = 0 // covered by a building, or a cutting: still the ground
+		}
+		layer = min(max(layer, -2), 2)
 		refs := append([]int64(nil), w.refs...)
 		ow := w.tags["oneway"]
 		if ow == "-1" {
@@ -215,8 +252,11 @@ func importRoads(m *mapdata.Map, ids []int64) {
 			}
 			if fwd == 0 {
 				fwd = 1
-				if hw == "primary" || hw == "secondary" {
+				switch hw {
+				case "primary", "secondary", "trunk":
 					fwd = 2
+				case "motorway":
+					fwd = 3
 				}
 			}
 			back = 0
@@ -231,21 +271,64 @@ func importRoads(m *mapdata.Map, ids []int64) {
 		var run []int
 		flush := func() {
 			if len(run) >= 2 {
-				m.Roads = append(m.Roads, mapdata.Road{Name: w.tags["name"], Class: class, Fwd: fwd, Back: back,
-					Nodes: run, Bridge: w.tags["bridge"] == "yes"})
+				bridge := bridgeTag
+				if classes["motorway"] {
+					class = hw // ramps keep their own class
+					bridge = bridge || layer > 0
+				}
+				*into = append(*into, mapdata.Road{Name: w.tags["name"], Class: class, Fwd: fwd, Back: back,
+					Nodes: run, Bridge: bridge, Layer: layer})
 			}
 			run = nil
 		}
+		// Motorways are cut exactly at the map edge, so they run off it
+		// rather than stopping short.
+		clip := classes["motorway"]
+		var prev int64
+		havePrev := false
 		for _, r := range refs {
 			n, ok := nodes[r]
-			if !ok || !inside(n.lat, n.lon) {
+			if !ok {
+				flush()
+				havePrev = false
+				continue
+			}
+			in := inside(n.lat, n.lon)
+			if clip && havePrev {
+				p := nodes[prev]
+				if pin := inside(p.lat, p.lon); pin != in {
+					run = append(run, edgeNode(m, p, n))
+				}
+			}
+			prev, havePrev = r, true
+			if !in {
 				flush()
 				continue
 			}
-			run = append(run, nodeIndex(r))
+			run = append(run, nodeIndex(m, r))
 		}
 		flush()
 	}
+}
+
+// edgeNode adds the point where the segment a–b crosses the map edge.
+func edgeNode(m *mapdata.Map, a, b node) int {
+	lo, hi := 0.0, 1.0
+	ain := inside(a.lat, a.lon)
+	for i := 0; i < 40; i++ {
+		t := (lo + hi) / 2
+		if inside(a.lat+(b.lat-a.lat)*t, a.lon+(b.lon-a.lon)*t) == ain {
+			lo = t
+		} else {
+			hi = t
+		}
+	}
+	t := lo
+	if !ain {
+		t = hi
+	}
+	m.Nodes = append(m.Nodes, project(a.lat+(b.lat-a.lat)*t, a.lon+(b.lon-a.lon)*t))
+	return len(m.Nodes) - 1
 }
 
 func ring(w way) ([]mapdata.Pt, bool) {
@@ -356,13 +439,82 @@ func importBuildingRelations(m *mapdata.Map) {
 	}
 }
 
+// importAreaRelations adds parks, woods and the like mapped as
+// multipolygons (outer rings).
+func importAreaRelations(m *mapdata.Map) {
+	var ids []int64
+	for id, r := range rels {
+		t := tags(r.Tags)
+		if t["type"] == "multipolygon" && t["natural"] != "water" && t["building"] == "" && areaKind(t) != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		r := rels[id]
+		k := areaKind(tags(r.Tags))
+		outer := map[int64]bool{}
+		for _, mb := range r.Members {
+			if _, ok := ways[mb.Ref]; ok && mb.Type == "way" && mb.Role == "outer" {
+				outer[mb.Ref] = true
+			}
+		}
+		for _, chain := range chains(outer) {
+			if len(chain) < 4 || chain[0] != chain[len(chain)-1] {
+				continue
+			}
+			pts, ok := ring(way{refs: chain})
+			if !ok || !overlaps(pts) {
+				continue
+			}
+			m.Areas = append(m.Areas, mapdata.Area{Kind: k, Pts: pts})
+		}
+	}
+}
+
+// overlaps reports whether a polygon's bounding box meets the map.
+func overlaps(pts []mapdata.Pt) bool {
+	br := project(s0, e0)
+	x0, y0, x1, y1 := math.Inf(1), math.Inf(1), math.Inf(-1), math.Inf(-1)
+	for _, p := range pts {
+		x0, y0, x1, y1 = math.Min(x0, p[0]), math.Min(y0, p[1]), math.Max(x1, p[0]), math.Max(y1, p[1])
+	}
+	return x1 >= 0 && y1 >= 0 && x0 <= br[0] && y0 <= br[1]
+}
+
+// importLandmarks places named landmarks from a JSON list
+// ([{name, osm, lat, lon, rank}]) on the map.
+func importLandmarks(m *mapdata.Map, path string) {
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var list []struct {
+		Name, OSM string
+		Lat, Lon  float64
+		Rank      int
+	}
+	if err := json.Unmarshal(data, &list); err != nil {
+		log.Fatalf("%s: %v", path, err)
+	}
+	for _, l := range list {
+		if inside(l.Lat, l.Lon) {
+			m.Landmarks = append(m.Landmarks, mapdata.Landmark{Name: l.Name, OSM: l.OSM, P: project(l.Lat, l.Lon), Rank: l.Rank})
+		}
+	}
+}
+
 func areaKind(t map[string]string) string {
 	switch {
 	case t["leisure"] == "park" || t["leisure"] == "garden" || t["leisure"] == "dog_park" || t["leisure"] == "playground":
 		return "park"
-	case t["leisure"] == "pitch":
+	case t["leisure"] == "pitch" || t["leisure"] == "golf_course":
 		return "pitch"
-	case t["landuse"] == "grass" || t["landuse"] == "flowerbed" || t["landuse"] == "village_green" || t["landuse"] == "recreation_ground":
+	case t["landuse"] == "grass" || t["landuse"] == "flowerbed" || t["landuse"] == "village_green" || t["landuse"] == "recreation_ground" ||
+		t["landuse"] == "cemetery" || t["leisure"] == "nature_reserve":
 		return "grass"
 	case t["natural"] == "wood" || t["natural"] == "scrub" || t["landuse"] == "forest" || t["natural"] == "shrubbery":
 		return "wood"

@@ -14,18 +14,34 @@ type EdgeID int
 
 type Vec2 struct{ X, Y float64 }
 
-// Level is the vertical layer a piece of track is built on. Only Ground is
-// buildable today; the others are reserved so metro and elevated light rail
-// can share the same network, pathfinding and signalling later. Track on
-// different levels never connects except through an explicit ramp/portal
-// edge (whose end nodes have different levels).
+// Level is the vertical layer a piece of track is built on. The city is
+// two-dimensional on screen but five levels deep: ground (the main level),
+// elevated viaducts above it and, higher still, the rare very tall
+// structure; ordinary tunnels below it and, deeper still, the rare deep
+// bore. Only Ground is buildable today; the others are reserved so metro,
+// elevated light rail and high-speed rail can share the same network,
+// pathfinding and signalling later. Track on different levels never
+// connects except through an explicit ramp/portal edge (whose end nodes
+// have different levels).
 type Level int
 
 const (
 	Ground Level = iota
 	Elevated
 	Underground
+	HighElevated    // above the viaducts: rare very tall structures
+	DeepUnderground // below the tunnels: rare deep bores
 )
+
+// Height is the level's place in the stack, from -2 (deep) to 2 (high).
+func (l Level) Height() int {
+	return [...]int{0, 1, -1, 2, -2}[l]
+}
+
+// LevelAt is the level at a height from -2 to 2 (clamped).
+func LevelAt(h int) Level {
+	return [...]Level{DeepUnderground, Underground, Ground, Elevated, HighElevated}[min(max(h, -2), 2)+2]
+}
 
 func (l Level) String() string {
 	switch l {
@@ -33,6 +49,10 @@ func (l Level) String() string {
 		return "elevated"
 	case Underground:
 		return "underground"
+	case HighElevated:
+		return "high elevated"
+	case DeepUnderground:
+		return "deep underground"
 	}
 	return "ground"
 }

@@ -103,7 +103,9 @@ func (g *Game) loadSeattleDemo() error {
 			stops = append(stops, id)
 		}
 	}
-	// Build the line, dropping any stop the track cannot serve.
+	// Crossovers at both ends, then build the line, dropping any stop the
+	// track cannot serve.
+	n.AddEndCrossovers(stops)
 	for len(stops) >= 2 {
 		if _, err := n.AddLine(stops); err == nil {
 			break
@@ -122,7 +124,7 @@ func (g *Game) loadSeattleDemo() error {
 		}
 	}
 	g.rebuild()
-	g.camX, g.camY, g.zoom = 760, 1500, 1.2
+	g.camX, g.camY, g.zoom = 2486, 3214, 1.2
 	return nil
 }
 
@@ -150,13 +152,17 @@ func (g *Game) placeStop(p street.Vec, name string) (street.StopID, bool) {
 			if !strings.HasPrefix(rd.Name, street) {
 				d += 80
 			}
+			// A divided boulevard's one-way halves cannot turn trams back.
+			if rd.OneWay() {
+				d += 60
+			}
 			cs = append(cs, cand{rd.ID, d, t})
 		}
 	}
 	sort.Slice(cs, func(i, j int) bool { return cs[i].d < cs[j].d })
 	for _, c := range cs {
 		for _, t := range []float64{c.t, 0.5*c.t + 0.25, 0.5} {
-			if id, err := n.AddStop(c.r, t); err == nil {
+			if id, err := n.AddStop(c.r, t, street.DefaultPlatform); err == nil {
 				n.Stops[id].Name = name
 				return id, true
 			}

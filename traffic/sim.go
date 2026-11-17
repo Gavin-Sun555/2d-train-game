@@ -50,6 +50,25 @@ type Vehicle struct {
 	DwellLeft float64
 
 	reversing bool // dwelling to change ends before running onto the twin link
+	// runFrom..runTo are the Path indices of the track the tram has
+	// reserved to run against the normal direction (runTo -1 if none); see
+	// runs.go.
+	runFrom, runTo int
+
+	riders map[street.StopID]int // passengers on board by destination
+	load   int
+	served bool // the tram is serving its current stop
+	doors  DoorState
+	doorT  float64 // s into the doors opening or closing
+	// Passengers still to get off here, and the time each door has put
+	// into the passenger going through it.
+	alightLeft              int
+	alightTimer, boardTimer float64
+	aheadSet                map[street.StopID]bool // cached: stops ahead before turning back
+	aheadOf                 int                    // call+1 aheadSet was worked out for
+
+	stats    TramStats
+	tripFrom float64 // s, when the current one-way run left its terminus (-1: none)
 
 	stuck float64 // seconds spent stopped while not dwelling (diagnostics)
 }
@@ -95,8 +114,10 @@ type Sim struct {
 	Stats      Stats
 
 	rng      *rand.Rand
+	src      *rand.PCG // rng's source, kept to save its state
 	nextID   int
 	carLanes []street.LinkID
+	laneCum  []float64 // running total of carLanes' lengths, to pick by length
 	depots   []*depot
 
 	// Rebuilt at the start of each tick, updated as admissions happen.
@@ -105,14 +126,27 @@ type Sim struct {
 	inbound []float64
 	// Track-block holders by direction sign.
 	holdPos, holdNeg []int
+	// Wrong-way runs: owner and requester of each unit of track (vehicle
+	// ID, 0 for none); see runs.go.
+	owner, req []int
+	reqTick    []int64
+
+	// Passengers (see passengers.go). PassengerRate scales how fast they
+	// arrive at the stops.
+	PassengerRate float64
+	Passengers    PassengerStats
+	lineStats     map[street.LineID]*LineStats
+	prng          *rand.Rand
+	psrc          *rand.PCG
+	queues        map[street.StopID]*stopQueue
 }
 
 const (
 	GiveUpAfter  = 240.0 // s
 	ReverseTime  = 8.0   // s for a tram to change ends
-	TramDwell    = 20.0
+	TramDwell    = 20.0  // s: least stop time when a line sets none (see street.Line.Dwell)
 	tramStartGap = 10.0
-	lookahead    = 220.0
+	lookahead    = 340.0
 	exitMargin   = 2.0
 )
 
@@ -130,11 +164,17 @@ type depot struct {
 // New creates a simulation with each line's fleet entering service one
 // headway apart, and cars filling in to targetCars over the first seconds.
 func New(n *street.Network, targetCars int, seed uint64) *Sim {
-	s := &Sim{Net: n, TargetCars: targetCars, rng: rand.New(rand.NewPCG(seed, 0x636172))}
+	src := rand.NewPCG(seed, 0x636172)
+	s := &Sim{Net: n, TargetCars: targetCars, rng: rand.New(src), src: src}
 	for i := range n.Links {
 		l := &n.Links[i]
 		if l.Kind == street.LaneLink && l.Modes&street.Car != 0 && l.Length > 50 {
 			s.carLanes = append(s.carLanes, l.ID)
+			total := l.Length
+			if k := len(s.laneCum); k > 0 {
+				total += s.laneCum[k-1]
+			}
+			s.laneCum = append(s.laneCum, total)
 		}
 	}
 	for i, id := range n.LineIDs() {
@@ -144,72 +184,93 @@ func New(n *street.Network, targetCars int, seed uint64) *Sim {
 			continue
 		}
 		fleet := min(l.Fleet(), MaxFleet(n, l))
-		s.depots = append(s.depots, &depot{line: id, start: start, cars: l.Cars(), left: fleet,
+		s.depots = append(s.depots, &depot{line: id, start: start, cars: n.TramSections(l), left: fleet,
 			next: tramStartGap * float64(i), headway: CycleTime(n, l) / float64(fleet)})
 	}
+	s.initPassengers(seed)
 	return s
 }
 
 // CycleTime estimates the seconds a tram takes to run the line's whole
 // calling pattern and come back to the first stop.
 func CycleTime(n *street.Network, l *street.Line) float64 {
-	cur, err := n.LineCycle(l)
+	path, plats, err := n.CyclePath(l)
 	if err != nil {
 		return 0
 	}
-	const avgSpeed = 7.0 // m/s with signals, junctions and braking
-	calls := l.Calls()
+	m := l.TramModel()
+	v0 := l.OperatingSpeed()
+	vStop := math.Min(v0, 15.0)
+	stopLoss := 0.5 * vStop * (1/math.Max(m.Accel, 0.5) + 1/math.Max(m.Decel, 0.5))
 	t := 0.0
-	for i := 1; i <= len(calls); i++ {
-		path, p, ok := n.TramRoute(cur.Link, cur.Pos, calls[i%len(calls)])
-		if !ok {
-			break
+	for i := range l.Calls() {
+		t += l.StopDwell(i) + stopLoss
+	}
+	for k, id := range path {
+		from, to := 0.0, n.Links[id].Length
+		if k == 0 {
+			from = plats[0].Pos
 		}
-		d := -cur.Pos
-		for k, id := range path {
-			d += n.Links[id].Length
-			if k > 0 && n.Links[path[k-1]].Twin == id {
-				t += ReverseTime + 10
-			}
+		if k == len(path)-1 {
+			to = plats[len(plats)-1].Pos
 		}
-		d -= n.Links[path[len(path)-1]].Length - p.Pos
-		t += math.Max(d, 0)/avgSpeed + TramDwell
-		cur = p
+		vc := math.Max(math.Min(n.Links[id].SpeedLimit, v0), 1.0)
+		t += math.Max(to-from, 0) / vc * 1.35
+		if k > 0 && k < len(path)-1 && n.Links[path[k-1]].Twin == id {
+			t += ReverseTime + 10
+		}
 	}
 	return t
 }
 
-// MaxFleet is how many trams the line can run: one when its whole route is
-// a single stretch of single track with nowhere for trams to pass.
+// MaxFleet is how many trams the line can run. It is one when trams have
+// nowhere to pass: the whole route is one stretch of single track, or the
+// line runs back over its own track against the normal direction (no
+// crossover where it turns back).
 func MaxFleet(n *street.Network, l *street.Line) int {
-	cur, err := n.LineCycle(l)
+	path, _, err := n.CyclePath(l)
 	if err != nil {
 		return 0
 	}
 	block := -2
-	calls := l.Calls()
-	for i := 1; i <= len(calls); i++ {
-		path, p, ok := n.TramRoute(cur.Link, cur.Pos, calls[i%len(calls)])
-		if !ok {
+	single := true
+	for _, id := range path {
+		lk := &n.Links[id]
+		if lk.Block < 0 || (block >= 0 && lk.Block != block) {
+			single = false
 			break
 		}
-		for _, id := range path {
-			lk := &n.Links[id]
-			if lk.Block < 0 || n.Blocks[lk.Block].Kind != street.SingleTrackBlock || (block >= 0 && lk.Block != block) {
-				return street.MaxTrams
-			}
-			block = lk.Block
-		}
-		cur = p
+		block = lk.Block
 	}
-	return 1
+	if single {
+		return 1
+	}
+	for t := 0; t < len(path); t++ {
+		if !runStart(n, path, t) {
+			continue
+		}
+		e := runEnd(n, path, t)
+		units := map[street.LinkID]bool{}
+		for j := t; j <= e; j++ {
+			units[unitOf(n, path[j])] = true
+		}
+		for j, id := range path {
+			if j >= t && j <= e || n.Links[id].Kind != street.LaneLink || !units[unitOf(n, id)] {
+				continue
+			}
+			if j == 0 && e == len(path)-1 {
+				continue // the cycle wraps round: the same run, continued
+			}
+			return 1
+		}
+		t = e
+	}
+	return street.MaxTrams
 }
 
 // headPos is where a tram of the given length stops its head for a
-// platform: centred on the platform built for the longest set.
-func headPos(p street.Platform, length float64) float64 {
-	return p.Pos - (street.TramLength-length)/2
-}
+// platform: centred on it.
+func headPos(p street.Platform, length float64) float64 { return p.Head(length) }
 
 // release puts trams waiting at the depots into service. It reports whether
 // any entered.
@@ -222,15 +283,31 @@ func (s *Sim) release() bool {
 		}
 		length := street.SetLength(d.cars)
 		pos := headPos(d.start, length)
-		v := &Vehicle{ID: s.nextID + 1, Kind: TramKind, Length: length, Width: 2.65, Cars: d.cars,
-			V0: 50 / 3.6, A: 1.0, B: 1.3, S0: 3, T: 1.5,
+		m := street.DefaultTramModel()
+		v0 := float64(m.MaxSpeedKmh) / 3.6
+		if l := s.Net.Lines[d.line]; l != nil {
+			m = l.TramModel()
+			v0 = l.OperatingSpeed()
+		}
+		v := &Vehicle{ID: s.nextID + 1, Kind: TramKind, Length: length, Width: m.Width, Cars: d.cars,
+			V0: v0, A: m.Accel, B: m.Decel, S0: 3, T: 1.5,
 			Path: []street.LinkID{d.start.Link}, S: pos, admitted: -1,
-			Line: d.line, call: 0, platIdx: -1, Dwelling: true, DwellLeft: 1}
+			Line: d.line, call: 0, platIdx: -1, runTo: -1, Dwelling: true, DwellLeft: 1, tripFrom: -1}
 		if !s.clearFor(v) {
 			continue // try again next tick
 		}
 		s.nextID++
 		s.Vehicles = append(s.Vehicles, v)
+		v.stats.Since = now
+		v.platform = d.start
+		// Entering service it stops at the first stop like at any stop on
+		// the way (it has no ends to change): the normal least stop time,
+		// taking on the first stop's passengers.
+		v.DwellLeft = TramDwell
+		if l := s.Net.Lines[d.line]; l != nil {
+			v.DwellLeft = float64(l.Dwell())
+		}
+		s.serve(v)
 		d.left--
 		d.next = now + d.headway
 		added = true
@@ -241,19 +318,11 @@ func (s *Sim) release() bool {
 // clearFor reports whether a tram can be placed where it stands.
 func (s *Sim) clearFor(v *Vehicle) bool {
 	id := v.Path[0]
-	if s.inbound[id] > 0 {
+	if s.inbound[id] > 0 || s.taken(v, id, true) {
 		return false
 	}
-	if l := &s.Net.Links[id]; l.Block >= 0 {
-		pos, neg := s.holdPos[l.Block], s.holdNeg[l.Block]
-		switch {
-		case s.Net.Blocks[l.Block].Kind == street.SingleTrackBlock, l.BlockSign < 0:
-			if pos+neg > 0 {
-				return false
-			}
-		case neg > 0:
-			return false
-		}
+	if l := &s.Net.Links[id]; l.Block >= 0 && s.holdPos[l.Block]+s.holdNeg[l.Block] > 0 {
+		return false
 	}
 	for _, e := range s.occ[id] {
 		if e.front > v.S-v.Length-v.S0 && e.front-e.v.Length < v.S+v.S0 {
@@ -287,6 +356,8 @@ func (s *Sim) Step() {
 	}
 	s.Vehicles = kept
 	s.spawnCars()
+	s.updatePassengers()
+	s.countTime()
 	s.Tick++
 }
 
@@ -349,7 +420,10 @@ func (s *Sim) rebuildOccupancy() {
 				s.holders[v.Path[j]]++
 			}
 		}
-		if v.admitted > v.idx && v.admitted+1 < len(v.Path) {
+		// Space claimed on the far side of a junction or crossover, until
+		// the head is through it.
+		if v.admitted+1 < len(v.Path) && (v.admitted > v.idx ||
+			(v.admitted == v.idx && s.Net.Links[v.Path[v.idx]].Kind != street.LaneLink)) {
 			s.inbound[v.Path[v.admitted+1]] += v.Length + exitMargin
 		}
 	}
@@ -362,6 +436,7 @@ func (s *Sim) rebuildOccupancy() {
 			return ea.v.ID < eb.v.ID
 		})
 	}
+	s.markRuns()
 }
 
 // ownHold lists the track blocks (by direction) the vehicle occupies or has
@@ -419,15 +494,8 @@ func (s *Sim) blockFree(v *Vehicle, id street.LinkID) bool {
 		neg--
 	}
 	ok := false
-	switch s.Net.Blocks[b].Kind {
-	case street.SingleTrackBlock:
+	if s.Net.Blocks[b].Kind == street.SingleTrackBlock {
 		ok = pos+neg == 0 || ownPos[b] || ownNeg[b]
-	case street.TurnbackBlock:
-		if l.BlockSign < 0 {
-			ok = pos+neg == 0 || ownNeg[b]
-		} else {
-			ok = neg == 0
-		}
 	}
 	if !ok {
 		return false
@@ -458,6 +526,11 @@ func (s *Sim) plan(v *Vehicle) (float64, float64) {
 	}
 	net := s.Net
 	cur := &net.Links[v.Path[v.idx]]
+	if v.Kind == TramKind {
+		if l := net.Lines[v.Line]; l != nil {
+			v.V0 = l.OperatingSpeed()
+		}
+	}
 	v0 := math.Min(v.V0, cur.SpeedLimit)
 	acc := math.Inf(1)
 	limit := math.Inf(1)
@@ -493,12 +566,41 @@ func (s *Sim) plan(v *Vehicle) (float64, float64) {
 		}
 		// Slow down in time for lower speed limits ahead.
 		v0 = math.Min(v0, math.Sqrt(l.SpeedLimit*l.SpeedLimit+2*v.B*d))
+		check := v.V*v.V/(2*v.B) + 2*v.V + 8
+		// Track reserved for a tram running against the normal direction.
+		if s.taken(v, l.ID, d > v.V*v.V/(2*v.B)+1) {
+			obstacle(d, 0, 0.5)
+			break
+		}
+		if v.Kind == TramKind && !s.owns(v, k) {
+			t := -1
+			if runStart(net, v.Path, k) {
+				t = k
+			} else if l.Kind != street.LaneLink && k+1 < len(v.Path) && runStart(net, v.Path, k+1) && !s.owns(v, k+1) {
+				t = k + 1 // reserve before taking the switch or junction into it
+			}
+			if t >= 0 && (d > check || leaderGap < d || !s.tryRun(v, t)) {
+				obstacle(d, 0, 0.5)
+				break
+			}
+		}
+		// A tram crossing over onto this track has priority.
+		if l.Kind == street.LaneLink && net.Links[v.Path[k-1]].Kind == street.LaneLink && s.inbound[l.ID] > 0 {
+			obstacle(d, 0, 0.5)
+			break
+		}
 		if l.Kind != street.LaneLink && k > v.admitted {
 			// Only the first vehicle in the queue may claim the movement:
 			// a follower holding it would block other movements while it
-			// waits behind its leader.
-			check := v.V*v.V/(2*v.B) + 2*v.V + 8
-			if d > check || leaderGap < d || !s.admit(v, k, d) {
+			// waits behind its leader. Beyond check distance, keep cruising
+			// while the signal and crossing ahead are open.
+			if d <= check {
+				if leaderGap < d || !s.admit(v, k, d) {
+					obstacle(d, 0, 0.5)
+					stopped = true
+					break
+				}
+			} else if !s.signalOpen(v, l, d) {
 				obstacle(d, 0, 0.5)
 				stopped = true
 				break
@@ -522,6 +624,27 @@ func (s *Sim) plan(v *Vehicle) (float64, float64) {
 	return math.Max(acc, -9), limit
 }
 
+// signalOpen reports whether a junction movement looks passable from beyond
+// admission range (green signal and no conflicting movement currently held).
+func (s *Sim) signalOpen(v *Vehicle, c *street.Link, d float64) bool {
+	if sig := s.Net.Signal(c.Junction); c.Kind == street.ConnectorLink && sig != nil {
+		switch sig.AspectAt(c.Phase, s.Seconds()) {
+		case street.Red:
+			return false
+		case street.Amber:
+			if d > v.V*v.V/(2*3.0) {
+				return false
+			}
+		}
+	}
+	for _, cc := range c.Conflicts {
+		if s.holders[cc] > 0 || (s.Net.Links[cc].Twin >= 0 && s.holders[s.Net.Links[cc].Twin] > 0) {
+			return false
+		}
+	}
+	return true
+}
+
 // admit tries to grant the movement Path[k] (a junction connector) at
 // distance d ahead.
 func (s *Sim) admit(v *Vehicle, k int, d float64) bool {
@@ -538,9 +661,16 @@ func (s *Sim) admit(v *Vehicle, k int, d float64) bool {
 		}
 	}
 	for _, cc := range c.Conflicts {
-		if s.holders[cc] > 0 {
+		if s.holders[cc] > 0 || (s.Net.Links[cc].Twin >= 0 && s.holders[s.Net.Links[cc].Twin] > 0) {
 			return false
 		}
+	}
+	if s.taken(v, c.ID, true) || (k+1 < len(v.Path) && s.taken(v, v.Path[k+1], true)) {
+		return false
+	}
+	if c.Kind == street.CrossoverLink && k+1 < len(v.Path) && !net.Links[v.Path[k+1]].Contra &&
+		s.approaching(v, map[street.LinkID]bool{unitOf(net, v.Path[k+1]): true}) {
+		return false // joining a track another vehicle is about to run on
 	}
 	// Track blocks: check both before claiming either.
 	if !s.blockOK(v, v.Path[k]) || (k+1 < len(v.Path) && !s.blockOK(v, v.Path[k+1])) {
@@ -575,13 +705,23 @@ func (s *Sim) admit(v *Vehicle, k int, d float64) bool {
 // move integrates one tick. It returns false when the vehicle leaves.
 func (s *Sim) move(v *Vehicle, acc, limit float64) bool {
 	if v.Dwelling {
+		serving := v.Kind == TramKind && v.served && !v.reversing
+		if serving {
+			s.stepDoors(v)
+		}
 		v.DwellLeft -= DT
-		if v.DwellLeft <= 0 {
-			if v.reversing {
-				s.reverse(v)
-			} else {
-				s.depart(v)
-			}
+		switch {
+		case v.DwellLeft > 0:
+		case v.reversing:
+			s.reverse(v)
+		case serving && v.doors == DoorsOpen && s.serviceDone(v):
+			// The least stop time is up and nobody is left to get off or
+			// on: the doors close (passengers can no longer board).
+			v.doors, v.doorT = DoorsClosing, 0
+		case serving && v.doors != DoorsClosed:
+			// Doors still opening, passengers still moving, or closing.
+		default:
+			s.depart(v)
 		}
 		return true
 	}
@@ -592,6 +732,9 @@ func (s *Sim) move(v *Vehicle, acc, limit float64) bool {
 		v.V = math.Min(v.V, step/DT)
 	}
 	v.S += step
+	if v.Kind == TramKind {
+		s.countRun(v, step)
+	}
 	for v.idx+1 < len(v.Path) && v.S >= s.Net.Links[v.Path[v.idx]].Length {
 		if s.Net.Links[v.Path[v.idx+1]].Kind != street.LaneLink && v.idx+1 > v.admitted {
 			// Never roll into a junction or crossover without admission.
@@ -623,6 +766,10 @@ func (s *Sim) move(v *Vehicle, acc, limit float64) bool {
 	case TramKind:
 		if v.idx == v.platIdx && math.Abs(v.platform.Pos-v.S) < 0.6 && v.V < 0.5 {
 			v.V, v.Dwelling, v.DwellLeft, v.platIdx = 0, true, TramDwell, -1
+			if l := s.Net.Lines[v.Line]; l != nil {
+				v.DwellLeft = l.StopDwell(v.call) // longer where it turns back
+			}
+			s.serve(v)
 			v.stuck = 0
 			s.Stats.TramArrivals++
 			s.Events = append(s.Events, Event{Tick: s.Tick, Vehicle: v.ID, Kind: TramArrive, Stop: v.platform.Stop})
@@ -650,6 +797,7 @@ func (s *Sim) reverse(v *Vehicle) {
 	if v.platIdx >= 0 {
 		v.platIdx -= k
 	}
+	v.runTo, v.runFrom = max(v.runTo-k, -1), max(v.runFrom-k, 0)
 	v.Dwelling, v.reversing = false, false
 	s.Stats.Reversals++
 }
@@ -663,17 +811,89 @@ func (s *Sim) depart(v *Vehicle) {
 	}
 	calls := line.Calls()
 	next := (v.call + 1) % len(calls)
-	path, p, ok := s.Net.TramRoute(v.Path[v.idx], v.S, calls[next])
-	if !ok {
-		v.DwellLeft = 5 // track missing; try again later
+	old := v.Path
+	var path []street.LinkID
+	var p street.Platform
+	// leave plans the way to the next stop and reserves what it needs. The
+	// tram first tries to change ends at the platform; if the track it would
+	// run back over cannot be reserved (trams queued on it, waiting for
+	// this very platform), it runs on to turn back at a crossover instead.
+	leave := func(route func(street.LinkID, float64, street.StopID, float64, ...street.StopID) ([]street.LinkID, street.Platform, bool)) (found, reserved bool) {
+		var ok bool
+		path, p, ok = route(v.Path[v.idx], v.S, calls[next], v.Length, calls[(next+1)%len(calls)])
+		if !ok {
+			return false, false
+		}
+		v.Path = append(append([]street.LinkID(nil), old[:v.idx+1]...), path[1:]...)
+		// Look one stop further, so a change of ends just past the platform
+		// is reserved before the tram runs onto that track.
+		if more, _, ok := s.Net.TramRoute(p.Link, headPos(p, v.Length), calls[(next+1)%len(calls)], v.Length, calls[(next+2)%len(calls)]); ok && len(more) > 1 {
+			v.Path = append(v.Path, more[1:]...)
+		}
+		// Leaving against the normal direction, or changing ends straight
+		// away, needs the track reserved first, unless changing ends just
+		// puts a tram that came in the wrong way back to running the normal
+		// way (trams waiting behind will simply follow it).
+		if (s.owns(v, v.idx) || runStart(s.Net, v.Path, v.idx)) && !s.backToNormal(v) && !s.tryRun(v, v.idx) {
+			v.Path = old
+			return true, false
+		}
+		return true, true
+	}
+	found, reserved := leave(s.Net.TramRoute)
+	if found && !reserved && s.turnsAtPlatform(v, path) {
+		found, reserved = leave(s.Net.TramRouteOnward)
+	}
+	switch {
+	case !found:
+		v.Path, v.DwellLeft = old, 5 // track missing; try again later
+		return
+	case !reserved:
+		v.Path, v.DwellLeft = old, 1
 		return
 	}
 	s.Events = append(s.Events, Event{Tick: s.Tick, Vehicle: v.ID, Kind: TramDepart, Stop: calls[v.call]})
+	s.countDepart(v, line, v.call)
+	v.served = false
 	v.call = next
-	v.Path = append(v.Path[:v.idx+1], path[1:]...)
 	p.Pos = headPos(p, v.Length)
 	v.platform, v.platIdx = p, v.idx+len(path)-1
 	v.Dwelling = false
+	// Leaving the other way: the driver changed ends during the stop.
+	if s.turnsHere(v) {
+		s.reverse(v)
+	}
+}
+
+// backToNormal reports whether the tram stands on wrong-way track and
+// leaves by changing ends onto the normal direction, with nobody else
+// holding that track for a wrong-way run.
+func (s *Sim) backToNormal(v *Vehicle) bool {
+	n := s.Net
+	if v.idx+1 >= len(v.Path) || !n.Links[v.Path[v.idx]].Contra || n.Links[v.Path[v.idx]].Twin != v.Path[v.idx+1] {
+		return false
+	}
+	for k := v.idx + 1; k < len(v.Path) && k <= v.idx+3; k++ {
+		if n.Links[v.Path[k]].Contra {
+			return false // it runs the wrong way again: reserve as usual
+		}
+	}
+	if o := s.owner[unitOf(n, v.Path[v.idx])]; o != 0 && o != v.ID {
+		return false
+	}
+	return true
+}
+
+// turnsAtPlatform reports whether a route changes ends where the tram
+// stands.
+func (s *Sim) turnsAtPlatform(v *Vehicle, path []street.LinkID) bool {
+	return len(path) > 1 && s.Net.Links[path[0]].Twin == path[1] && s.Net.TurnsInPlace(path[0], v.S, v.Length)
+}
+
+// turnsHere reports whether the tram's path changes ends where it stands.
+func (s *Sim) turnsHere(v *Vehicle) bool {
+	return v.idx+1 < len(v.Path) && s.Net.Links[v.Path[v.idx]].Twin == v.Path[v.idx+1] &&
+		s.Net.TurnsInPlace(v.Path[v.idx], v.S, v.Length)
 }
 
 // trimPath drops links the tram has fully left so paths stay short.
@@ -689,6 +909,7 @@ func (s *Sim) trimPath(v *Vehicle) {
 	if v.platIdx >= 0 {
 		v.platIdx -= first
 	}
+	v.runTo, v.runFrom = max(v.runTo-first, -1), max(v.runFrom-first, 0)
 }
 
 // --- cars -------------------------------------------------------------------
@@ -708,7 +929,9 @@ func (s *Sim) spawnCars() {
 		return
 	}
 	need := s.TargetCars - s.CarCount()
-	for try := 0; try < 4 && need > 0; try++ {
+	// Fill up faster while far below the target (each try routes a car).
+	tries := min(4+need/200, 12)
+	for try := 0; try < tries && need > 0; try++ {
 		if s.trySpawn() {
 			need--
 		}
@@ -718,14 +941,28 @@ func (s *Sim) spawnCars() {
 const carLength = 4.5
 
 func (s *Sim) trySpawn() bool {
-	from := s.carLanes[s.rng.IntN(len(s.carLanes))]
-	to := s.carLanes[s.rng.IntN(len(s.carLanes))]
+	// Cars are spread evenly over the streets (lanes picked by length) and
+	// make local trips, so traffic covers the whole map instead of piling
+	// up on the routes across it.
+	from := s.pickLane()
+	to := s.pickLane()
+	mid := func(id street.LinkID) street.Vec {
+		p := s.Net.Links[id].Pts
+		return p[len(p)/2]
+	}
+	for k := 0; k < 8; k++ {
+		a, b := mid(from), mid(to)
+		if d := math.Hypot(a.X-b.X, a.Y-b.Y); d >= minTrip && d <= maxTrip {
+			break
+		}
+		to = s.pickLane()
+	}
 	if from == to {
 		return false
 	}
 	fl := &s.Net.Links[from]
 	pos := 15 + s.rng.Float64()*(fl.Length-30)
-	if pos-carLength < s.inbound[from]+5 {
+	if pos-carLength < s.inbound[from]+5 || s.taken(nil, from, true) {
 		return false
 	}
 	used := s.inbound[from]
@@ -748,7 +985,7 @@ func (s *Sim) trySpawn() bool {
 	v := &Vehicle{ID: s.nextID, Kind: CarKind, Length: carLength, Width: 1.9,
 		V0: (50 / 3.6) * (0.9 + 0.25*s.rng.Float64()), A: 1.6, B: 2.5, S0: 2, T: 1.3,
 		Path: path, S: pos, admitted: -1, DestPos: s.Net.Links[to].Length / 2,
-		Variant: uint8(s.rng.IntN(8)), platIdx: -1}
+		Variant: uint8(s.rng.IntN(8)), platIdx: -1, runTo: -1}
 	s.Vehicles = append(s.Vehicles, v)
 	s.occ[from] = append(s.occ[from], entry{v: v, front: pos})
 	sort.Slice(s.occ[from], func(a, b int) bool { return s.occ[from][a].front < s.occ[from][b].front })
@@ -804,4 +1041,124 @@ func (s *Sim) Find(id int) *Vehicle {
 		}
 	}
 	return nil
+}
+
+// Car trips run between these distances (straight line), where the map
+// allows.
+const (
+	minTrip = 200.0  // m
+	maxTrip = 1500.0 // m
+)
+
+// pickLane picks a car lane, longer lanes more often, so cars are spread
+// evenly along the streets.
+func (s *Sim) pickLane() street.LinkID {
+	total := s.laneCum[len(s.laneCum)-1]
+	x := s.rng.Float64() * total
+	i := sort.SearchFloat64s(s.laneCum, x)
+	return s.carLanes[min(i, len(s.carLanes)-1)]
+}
+
+// AtTurnBack reports whether the tram is at (or heading for) a stop where
+// its line turns back.
+func (s *Sim) AtTurnBack(v *Vehicle) bool {
+	l := s.Net.Lines[v.Line]
+	return l != nil && l.TurnsAt(v.call)
+}
+
+// DistanceToStop is how far the tram's head still has to run to where it
+// stops at its next platform (false while it stands at a stop or is not
+// heading for one).
+func (s *Sim) DistanceToStop(v *Vehicle) (float64, bool) {
+	if v.Kind != TramKind || v.Dwelling || v.platIdx < v.idx || v.platIdx >= len(v.Path) {
+		return 0, false
+	}
+	d := -v.S
+	for k := v.idx; k < v.platIdx; k++ {
+		d += s.Net.Links[v.Path[k]].Length
+	}
+	return math.Max(0, d+v.platform.Pos), true
+}
+
+// InCrossing reports whether any part of the tram is in a crossing (a
+// junction of three or more roads, not a bend or a crossover).
+func (s *Sim) InCrossing(v *Vehicle) bool {
+	in := false
+	s.covered(v, func(k int, _ float64) {
+		l := &s.Net.Links[v.Path[k]]
+		if l.Kind == street.ConnectorLink && len(s.Net.RoadsAt(l.Junction)) >= 3 {
+			in = true
+		}
+	})
+	return in
+}
+
+// PastLastCrossing reports whether the tram's head has reached the last
+// crossing before its next stop (true if there is none on the way): where
+// trams announce the stop.
+func (s *Sim) PastLastCrossing(v *Vehicle) bool {
+	if v.Kind != TramKind || v.Dwelling || v.platIdx < v.idx || v.platIdx >= len(v.Path) {
+		return false
+	}
+	last := -1
+	for k := v.idx; k < v.platIdx; k++ {
+		l := &s.Net.Links[v.Path[k]]
+		if l.Kind == street.ConnectorLink && len(s.Net.RoadsAt(l.Junction)) >= 3 {
+			last = k
+		}
+	}
+	return last <= v.idx
+}
+
+// Call is the index in its line's calling pattern of the stop the tram is
+// standing at or heading for.
+func (s *Sim) Call(v *Vehicle) int { return v.call }
+
+// DoorState is where a tram's doors are in their cycle at a stop.
+type DoorState uint8
+
+const (
+	DoorsClosed DoorState = iota
+	DoorsOpening
+	DoorsOpen
+	DoorsClosing
+)
+
+// Door timings, s.
+const (
+	DoorOpenTime  = 2.0 // from arriving to the doors fully open
+	DoorCloseTime = 3.0 // the closing warning and the doors closing
+)
+
+// stepDoors runs the doors at a stop: opening, then passengers through the
+// open doors, then (started by move) closing.
+func (s *Sim) stepDoors(v *Vehicle) {
+	switch v.doors {
+	case DoorsOpening:
+		v.doorT += DT
+		if v.doorT >= DoorOpenTime {
+			v.doors, v.doorT = DoorsOpen, 0
+		}
+	case DoorsOpen:
+		s.stepService(v)
+	case DoorsClosing:
+		v.doorT += DT
+		if v.doorT >= DoorCloseTime {
+			v.doors, v.doorT = DoorsClosed, 0
+		}
+	}
+}
+
+// Doors is the tram's doors and how far they are open, 0 (shut) to 1.
+func (v *Vehicle) Doors() (DoorState, float64) {
+	switch v.doors {
+	case DoorsOpening:
+		return v.doors, math.Min(1, v.doorT/DoorOpenTime)
+	case DoorsOpen:
+		return v.doors, 1
+	case DoorsClosing:
+		// The warning sounds for the first second; then the doors close.
+		return v.doors, 1 - math.Max(0, math.Min(1, (v.doorT-1)/(DoorCloseTime-1)))
+	}
+	return v.doors, 0
 }
